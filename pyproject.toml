@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llada-quant"
+version = "0.1.0"
+description = "Independent quantization framework for LLaDA-style MoE models: groupwise INT8/INT4 weight quantization, quantized runtimes, versioned checkpoints."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.urls]
+Homepage = "https://github.com/<you>/llada-quant"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
