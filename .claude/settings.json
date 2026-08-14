@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"C:/Users/Dr.console/OneDrive - SUPCOM/Bureau/Nouveau dossier \\(2\\)/test_llada\" && ls src eval model_update 2>/dev/null && echo \"=== dInfer ===\" && ls dInfer | head -20)",
+      "Read(//c/Users/Dr.console/OneDrive - SUPCOM/Bureau/Nouveau dossier \\\\\\(2\\\\\\)/test_llada/**)",
+      "Bash(python -m pytest tests/unit/test_trajectory.py -q)",
+      "Bash(\"C:/Users/Dr.console/AppData/Local/Programs/Python/Python314/python.exe\" -m pytest tests/unit/test_trajectory.py -q)",
+      "Bash(\"C:/Users/Dr.console/AppData/Local/Programs/Python/Python314/python.exe\" -m pytest tests -q)",
+      "PowerShell(& \"C:\\\\Users\\\\Dr.console\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python314\\\\python.exe\" \"C:\\\\Users\\\\Dr.console\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Dr-console-OneDrive---SUPCOM-Bureau-Nouveau-dossier--2--llada-quant\\\\7c205cf6-0c9c-48d0-b905-04a11464b102\\\\scratchpad\\\\demo.py\")"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Dr.console\\AppData\\Local\\Temp\\claude\\c--Users-Dr-console-OneDrive---SUPCOM-Bureau-Nouveau-dossier--2--llada-quant\\7c205cf6-0c9c-48d0-b905-04a11464b102\\scratchpad"
+    ]
+  }
+}

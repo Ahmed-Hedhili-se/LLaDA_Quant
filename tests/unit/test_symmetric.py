@@ -1,6 +1,6 @@
 import torch
 
-from llada_quant.algorithms.symmetric import (
+from LLaDA_Quant.algorithms.symmetric import (
     dequantize_tensor,
     pack_int4,
     qmax_for_bits,

@@ -1,13 +1,13 @@
 import torch
 
-from llada_quant.config import QuantConfig
-from llada_quant.formats.manifest import MANIFEST_FILENAME, SOURCE_FILENAME, QuantEntry, QuantizationManifest
-from llada_quant.formats.safetensors import (
+from LLaDA_Quant.config import QuantConfig
+from LLaDA_Quant.formats.manifest import MANIFEST_FILENAME, SOURCE_FILENAME, QuantEntry, QuantizationManifest
+from LLaDA_Quant.formats.safetensors import (
     WEIGHTS_FILENAME,
     load_quantized_checkpoint,
     save_quantized_checkpoint,
 )
-from llada_quant.runtime.linear import QuantLinear
+from LLaDA_Quant.runtime.linear import QuantLinear
 
 
 def test_manifest_json_roundtrip(tmp_path):
@@ -62,14 +62,14 @@ def test_load_quantized_weights_restores_expert_buffers(tmp_path):
     torch.manual_seed(0)
     cfg = QuantConfig(bits=8, group_size=64, targets=("expert",))
     block = make_fake_fused_block()
-    from llada_quant.adapters.llada_moe import quantize_llada_experts
+    from LLaDA_Quant.adapters.llada_moe import quantize_llada_experts
 
     quantize_llada_experts(block, cfg)
     fresh = make_fake_fused_block(seed=99)
     manifest = QuantizationManifest(config=cfg, entries=[QuantEntry(tensor_name="x", shape=[1], bits=8, group_size=64, storage_dtype="int8", compute_dtype="bfloat16")])
     save_quantized_checkpoint(block, manifest, str(tmp_path))
 
-    from llada_quant.api import load_quantized_weights
+    from LLaDA_Quant.api import load_quantized_weights
 
     load_quantized_weights(fresh, str(tmp_path))
     for attr in ("_qw1", "_sw1", "_qw2", "_sw2"):

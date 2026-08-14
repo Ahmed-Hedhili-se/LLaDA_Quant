@@ -1,7 +1,7 @@
 import torch
 
-from llada_quant.config import QuantConfig
-from llada_quant.runtime.linear import QuantLinear
+from LLaDA_Quant.config import QuantConfig
+from LLaDA_Quant.runtime.linear import QuantLinear
 
 
 def test_quantlinear_matches_linear_within_tolerance():

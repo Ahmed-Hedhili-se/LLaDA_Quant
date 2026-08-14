@@ -8,9 +8,11 @@ as a dependency.
 
 **Current status (v0.1):** symmetric groupwise **INT8** reference implementation
 (dequantize-then-matmul), generic `QuantLinear`, fused-expert `w1`/`w2`
-adapter, versioned checkpoint format, validation metrics, benchmarks.
-Triton INT8/INT4 kernels that consume packed weights directly are planned for
-v0.3.
+adapter, versioned checkpoint format, validation metrics, benchmarks, and
+[diffusion-trajectory validation](#diffusion-trajectory-validation) —
+divergence measured *across denoising steps* rather than on a single forward
+pass. Triton INT8/INT4 kernels that consume packed weights directly are
+planned for v0.3.
 
 ---
 
@@ -28,6 +30,7 @@ v0.3.
   - [Runtime modules](#runtime-modules)
   - [Adapters](#adapters)
   - [Validation](#validation)
+- [Diffusion-trajectory validation](#diffusion-trajectory-validation)
 - [Checkpoint format](#checkpoint-format)
 - [Testing](#testing)
 - [Benchmarks](#benchmarks)
@@ -73,7 +76,7 @@ pip install -e ".[dev]"
 ## Quick start
 
 ```python
-from llada_quant import (
+from LLaDA_Quant import (
     QuantConfig,
     QuantizationManifest,
     quantize_model,
@@ -148,7 +151,7 @@ dimension (or `group_size=-1`), it falls back to per-tensor scaling.
 
 ### Configuration
 
-`llada_quant.config.QuantConfig`
+`LLaDA_Quant.config.QuantConfig`
 
 ```python
 QuantConfig(
@@ -167,7 +170,7 @@ embeds the full config so a run is reproducible.
 
 ### Model quantization
 
-`llada_quant.api`
+`LLaDA_Quant.api`
 
 | Function | Description |
 |---|---|
@@ -178,7 +181,7 @@ embeds the full config so a run is reproducible.
 
 ### Checkpoint save / load
 
-`llada_quant.formats.safetensors`
+`LLaDA_Quant.formats.safetensors`
 
 | Function | Description |
 |---|---|
@@ -186,7 +189,7 @@ embeds the full config so a run is reproducible.
 | `load_quantized_checkpoint(directory) -> (state_dict, manifest)` | Raw tensors + manifest, without touching any model. |
 | `load_quantized_weights(model, directory, strict=True)` | Model-level load (see above). |
 
-`llada_quant.formats.manifest`
+`LLaDA_Quant.formats.manifest`
 
 - `QuantizationManifest(format_version, framework_version, created_at, source_checkpoint, config, entries)` — `to_dict()`, `from_dict()`, `to_json()`, `save(directory)`.
 - `QuantEntry(tensor_name, shape, bits, group_size, storage_dtype, compute_dtype, source_tensor, sha256)` — per-tensor metadata.
@@ -194,7 +197,7 @@ embeds the full config so a run is reproducible.
 
 ### Low-level algorithms
 
-`llada_quant.algorithms.symmetric`
+`LLaDA_Quant.algorithms.symmetric`
 
 | Function | Description |
 |---|---|
@@ -207,7 +210,7 @@ embeds the full config so a run is reproducible.
 
 ### Runtime modules
 
-`llada_quant.runtime.linear.QuantLinear`
+`LLaDA_Quant.runtime.linear.QuantLinear`
 
 ```python
 QuantLinear(in_features, out_features, bits=8, group_size=128,
@@ -222,7 +225,7 @@ Call semantics are identical to `nn.Linear`: `out = qlin(x)` returns a
 BF16 tensor of shape `(..., out_features)`. Storage: `qweight`
 `[out_features, in_features]` int8, `scale` `[out_features, num_groups]`.
 
-`llada_quant.runtime.moe`
+`LLaDA_Quant.runtime.moe`
 
 | Function / class | Description |
 |---|---|
@@ -234,7 +237,7 @@ BF16 tensor of shape `(..., out_features)`. Storage: `qweight`
 
 ### Adapters
 
-`llada_quant.adapters.llada_moe` (LLaDA-specific, targets `TritonFusedMoEBlock`)
+`LLaDA_Quant.adapters.llada_moe` (LLaDA-specific, targets `TritonFusedMoEBlock`)
 
 | Function | Description |
 |---|---|
@@ -242,7 +245,7 @@ BF16 tensor of shape `(..., out_features)`. Storage: `qweight`
 | `quantize_llada_experts(model, config) -> list[str]` | Quantize all fused expert blocks in place; registers `_qw1/_sw1/_qw2/_sw2` buffers. |
 | `restore_llada_experts_from_buffers(model, config)` | Re-materialize `w1`/`w2` from the packed buffers. |
 
-`llada_quant.adapters.torch` (generic)
+`LLaDA_Quant.adapters.torch` (generic)
 
 | Function | Description |
 |---|---|
@@ -250,7 +253,7 @@ BF16 tensor of shape `(..., out_features)`. Storage: `qweight`
 
 ### Validation
 
-`llada_quant.validation.metrics`
+`LLaDA_Quant.validation.metrics`
 
 | Function | Description |
 |---|---|
@@ -259,8 +262,13 @@ BF16 tensor of shape `(..., out_features)`. Storage: `qweight`
 | `cosine_similarity(a, b)` | Cosine similarity of flattened tensors. |
 | `router_overlap(topk_ids_a, topk_ids_b) -> float` | Fraction of (token, rank) slots where two routings agree — the key diagnostic for this codebase. |
 | `summarize_metrics(a, b) -> dict` | All of the above in one dict. |
+| `top1_agreement(a, b, positions=None) -> float` | Fraction of positions predicting the same token id. |
+| `kl_divergence(ref, other, positions=None) -> float` | Mean `KL(ref ‖ other)` in nats. |
+| `unmask_selection_agreement(a, b, mask_positions, k=1) -> float` | Overlap of the positions each model would unmask next. |
+| `top2_margin(logits, positions=None) -> float` | How decisive the reference is. |
+| `tie_fraction(ref, other, positions=None) -> float` | Share of positions where the reference's margin is below the quantization shift. |
 
-`llada_quant.validation.compare.compare_models(reference, quantized, components, get_inputs_fn, forward_fn, router_fn, dtype) -> dict[str, ComponentReport]`
+`LLaDA_Quant.validation.compare.compare_models(reference, quantized, components, get_inputs_fn, forward_fn, router_fn, dtype) -> dict[str, ComponentReport]`
 
 Compares named submodules of two models on identical inputs; `ComponentReport`
 carries the metrics plus `router_overlap`. `forward_fn(module, inputs)` and
@@ -269,6 +277,92 @@ carries the metrics plus `router_overlap`. `forward_fn(module, inputs)` and
 > Do not use text equality as your only gate: small numerical perturbations
 > change diffusion trajectories. Track logit similarity and per-layer router
 > overlap instead.
+
+---
+
+## Diffusion-trajectory validation
+
+`compare_models` answers *how wrong is this layer on one forward pass* — the
+standard PTQ question, and one that is structurally blind to how a masked
+diffusion LM actually fails. A small logit shift changes **which position gets
+unmasked**; that position becomes context for every later step; the error
+compounds along the schedule. `LLaDA_Quant.validation.trajectory` measures
+that directly.
+
+The boundary from [Design goals](#design-goals) is unchanged: **no decoding
+logic lives here.** You pass callables, and your inference repository keeps
+owning the forward pass, the router internals and the unmasking rule.
+
+### Building denoising states
+
+`LLaDA_Quant.validation.diffusion`
+
+| Function | Description |
+|---|---|
+| `DiffusionState(step, input_ids, mask_positions, attention_mask=None, label="")` | One point on a trajectory. `num_masked` / `mask_ratio` / `describe()`. |
+| `fully_masked_state(prompt_ids, gen_length, mask_token_id)` | Prompt + all-mask generation region: the trajectory start. |
+| `make_masked_states(prompt_ids, completion_ids, mask_token_id, ratios=..., generator=None)` | A **monotone** early/middle/late schedule — positions are only ever revealed, never re-masked, so state *i+1*'s masked set is a strict subset of state *i*'s. |
+| `mask_positions_from_ids(input_ids, mask_token_id)` | Boolean mask helper. |
+
+### The two entry points
+
+| Function | What it isolates |
+|---|---|
+| `compare_trajectory(reference, quantized, states, logits_fn, router_fn=None, unmask_k=1, masked_positions_only=True)` | **Teacher-forced.** Both models see byte-identical inputs, so every difference is quantization alone. Shows per-step sensitivity; by construction cannot show compounding. |
+| `compare_free_running(reference, quantized, initial_state, logits_fn, advance_fn, max_steps=64)` | **Self-driven.** Each model denoises with its own logits through *your* unmasking rule. Inputs drift apart — that is the point. This is where compounding becomes visible. |
+
+Callbacks you supply:
+
+```python
+logits_fn(model, state)   -> Tensor [B, L, vocab]
+router_fn(model, state)   -> Tensor | {layer_name: Tensor} | None   # top-k expert ids
+advance_fn(state, logits) -> DiffusionState | None                  # your unmasking rule
+```
+
+```python
+from LLaDA_Quant import (
+    QuantConfig, quantized_model, make_masked_states, compare_trajectory,
+)
+
+reference = load_llada_moe()                       # your BF16 model
+quantized = quantized_model(reference, QuantConfig(bits=8, group_size=128))
+
+states = make_masked_states(prompt_ids, completion_ids, mask_token_id=MASK_ID,
+                            ratios=(1.0, 0.75, 0.5, 0.25, 0.1))
+
+report = compare_trajectory(
+    reference, quantized, states,
+    logits_fn=lambda m, s: m(s.input_ids).logits,
+    router_fn=lambda m, s: collect_topk_ids(m),    # from your own hooks
+    unmask_k=block_size,                           # match your decoder
+)
+print(report.to_table())
+json.dump(report.to_dict(), open("trajectory-int8.json", "w"))
+```
+
+`TrajectoryReport` gives `states`, `series(key)` (the degradation *shape* in
+step order), `worst_state`, `min_router_overlap`, `to_table()`, `to_dict()`.
+`FreeRunReport` gives `steps`, `first_divergence_step`, `final_token_agreement`
+and the two final id tensors.
+
+### Reading the numbers
+
+Per state: `top1_agreement`, `unmask_agreement`, `kl_masked`, per-layer
+`router_overlap`, plus the standard logit metrics restricted to masked slots.
+
+Two of these carry the load. **`unmask_agreement`** catches models that agree
+on every predicted token yet unmask in a different order — invisible to top-1
+agreement, but it changes the context all later steps condition on.
+**`tie_fraction`** guards against over-reading the rest: it reports the share
+of positions where the *reference's own* top-2 margin is smaller than the
+logit shift quantization introduced. Disagreement there is a coin-toss on a
+tie, not damage.
+
+That guard is not hypothetical. On the toy model in the test suite, INT8
+scores `top1_agreement = 0.0` at the fully masked state — with
+`tie_fraction = 1.0`, because the reference's margin is ~1e-5 against ~5e-3 of
+INT8 noise. Reported alone, the first number looks catastrophic and means
+nothing. **Never quote an agreement number without its tie fraction.**
 
 ---
 
@@ -300,6 +394,7 @@ Test layers:
 |---|---|
 | Unit | quantize/dequantize error bounds, int4 pack roundtrip, `QuantLinear` vs `nn.Linear`, adapter buffer registration, manifest JSON roundtrip, checkpoint save/load, router-overlap metric |
 | Component | one fused MoE layer output error vs BF16 reference |
+| Trajectory | monotone schedule construction, masked-token metrics, teacher-forced and free-running divergence on a toy masked diffusion LM |
 | Regression / E2E | planned: fixed prompts + seeds, routing overlap, task accuracy, memory, tokens/sec |
 
 ---
@@ -334,7 +429,10 @@ Metrics: GPU memory, prefill/generation latency, throughput, router overlap, tas
 1. **v0.1** (current): INT8 reference implementation, `QuantLinear`, LLaDA
    expert adapter, metadata, tests.
 2. **v0.2**: full model-side integration in the inference project (editable
-   install), BF16-fallback toggle, attention projection quantization.
+   install), BF16-fallback toggle, attention projection quantization, and a
+   measured trajectory report on the real LLaDA-MoE checkpoint. If INT8 router
+   overlap turns out flat across the schedule, that is the finding — it points
+   the work at INT4 rather than at more diffusion-specific machinery.
 3. **v0.3**: Triton INT8 (W8A16) fused-MoE kernel consuming the packed buffers
    directly, with benchmarks vs BF16.
 4. **v0.4**: groupwise INT4 + packing, activation calibration, outlier handling.

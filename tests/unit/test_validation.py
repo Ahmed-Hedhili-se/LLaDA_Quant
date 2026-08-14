@@ -1,9 +1,9 @@
 import torch
 import pytest
 
-from llada_quant.adapters.llada_moe import quantize_llada_experts
-from llada_quant.config import QuantConfig
-from llada_quant.validation.metrics import (
+from LLaDA_Quant.adapters.llada_moe import quantize_llada_experts
+from LLaDA_Quant.config import QuantConfig
+from LLaDA_Quant.validation.metrics import (
     cosine_similarity,
     max_abs_error,
     router_overlap,

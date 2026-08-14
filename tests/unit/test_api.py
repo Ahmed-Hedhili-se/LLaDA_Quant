@@ -2,9 +2,9 @@ import copy
 
 import torch
 
-from llada_quant.api import quantize_model, quantized_model
-from llada_quant.config import QuantConfig, matches
-from llada_quant.runtime.linear import QuantLinear
+from LLaDA_Quant.api import quantize_model, quantized_model
+from LLaDA_Quant.config import QuantConfig, matches
+from LLaDA_Quant.runtime.linear import QuantLinear
 
 
 def test_matches_respects_excludes():

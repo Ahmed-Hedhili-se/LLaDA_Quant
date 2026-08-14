@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "llada-quant"
+name = "LLaDA_Quant"
 version = "0.1.0"
 description = "Independent quantization framework for LLaDA-style MoE models: groupwise INT8/INT4 weight quantization, quantized runtimes, versioned checkpoints."
 readme = "README.md"
@@ -22,7 +22,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/<you>/llada-quant"
+Homepage = "https://github.com/Ahmed-Hedhili-se/LLaDA_Quant"
 
 [tool.setuptools.packages.find]
 where = ["src"]

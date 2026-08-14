@@ -1,4 +1,4 @@
-"""llada-quant: independent quantization framework for LLaDA-style MoE models.
+"""LLaDA_Quant: independent quantization framework for LLaDA-style MoE models.
 
 v0.1: symmetric groupwise INT8 weight quantization, reference QuantLinear +
 fused-expert (w1/w2) adapter, versioned checkpoint format, validation tools.
@@ -12,6 +12,15 @@ from .api import (
     quantized_model,
     save_quantized_checkpoint,
 )
+from .validation import (
+    DiffusionState,
+    FreeRunReport,
+    TrajectoryReport,
+    compare_free_running,
+    compare_trajectory,
+    fully_masked_state,
+    make_masked_states,
+)
 
 __version__ = "0.1.0"
 
@@ -22,5 +31,12 @@ __all__ = [
     "quantized_model",
     "save_quantized_checkpoint",
     "load_quantized_weights",
+    "DiffusionState",
+    "make_masked_states",
+    "fully_masked_state",
+    "compare_trajectory",
+    "compare_free_running",
+    "TrajectoryReport",
+    "FreeRunReport",
     "__version__",
 ]

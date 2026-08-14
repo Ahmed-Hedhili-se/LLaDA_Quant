@@ -2,9 +2,9 @@ import copy
 
 import torch
 
-from llada_quant.adapters.llada_moe import is_fused_expert_block, quantize_llada_experts
-from llada_quant.config import QuantConfig
-from llada_quant.runtime.moe import quantize_fused_experts
+from LLaDA_Quant.adapters.llada_moe import is_fused_expert_block, quantize_llada_experts
+from LLaDA_Quant.config import QuantConfig
+from LLaDA_Quant.runtime.moe import quantize_fused_experts
 
 
 def make_fake_fused_block(num_experts=8, hidden=128, intermediate=256, seed=0):

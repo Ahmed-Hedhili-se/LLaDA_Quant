@@ -16,7 +16,7 @@ import time
 
 import torch
 
-from llada_quant.algorithms.symmetric import quantize_tensor
+from LLaDA_Quant.algorithms.symmetric import quantize_tensor
 
 
 def build_expert_weights(num_experts: int, hidden: int, intermediate: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
