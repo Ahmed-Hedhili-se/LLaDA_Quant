@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "LLaDA_Quant"
-version = "0.1.0"
-description = "Independent quantization framework for LLaDA-style MoE models: groupwise INT8/INT4 weight quantization, quantized runtimes, versioned checkpoints."
+version = "0.2.0"
+description = "Quantization stack for LLaDA-MoE diffusion LLM inference: packed INT8/INT4 expert weights, measured memory reduction, and trajectory-aware validation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
