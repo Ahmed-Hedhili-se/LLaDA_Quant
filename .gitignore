@@ -1,13 +1,51 @@
+# Python
 __pycache__/
 *.py[cod]
+*.so
 *.egg-info/
 dist/
 build/
-.pytest_cache/
+.eggs/
+
+# Environments
 .venv/
 venv/
+env/
+.tox/
+
+# Test / type / coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors and tooling. `.claude/settings.json` holds absolute machine paths
+# and per-session scratchpad UUIDs, so it is local state, not shared config.
 .idea/
 .vscode/
+.claude/
+
+# Quantized artifacts. Weights are large and derived; regenerate them from a
+# source checkpoint plus the QuantConfig recorded in quantization.json.
 *.safetensors
 quantized_checkpoints/
-.coverage
+*-int4/
+*-int8/
+
+# Measurement outputs. Traces and routing dumps are reproducible from the
+# benchmarks; only the numbers quoted in the docs are worth versioning.
+traces/
+*.pt
+benchmark_reports/
+*.log
+
+# OS / sync cruft (this tree lives under OneDrive)
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Merge leftovers
+*.orig
+*.rej

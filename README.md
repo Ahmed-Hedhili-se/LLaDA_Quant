@@ -1,368 +1,267 @@
 # LLaDA_Quant
 
-Independent quantization framework for LLaDA-style MoE models (and any PyTorch
-model made of linear layers). It handles **weight quantization only** — no
-diffusion decoding, KV caching, serving, or orchestration. Your model /
-inference application stays a separate repository and consumes this framework
-as a dependency.
+Quantization stack for **LLaDA-MoE diffusion LLM inference**: packed low-bit
+expert weights, a measured memory story, and a trajectory-aware evaluation
+layer that explains what quantization does to diffusion generation. Decoding,
+KV caching and serving stay in the inference repository; this package is
+consumed as a dependency.
 
-**Current status (v0.1):** symmetric groupwise **INT8** reference implementation
-(dequantize-then-matmul), generic `QuantLinear`, fused-expert `w1`/`w2`
-adapter, versioned checkpoint format, validation metrics, benchmarks, and
-[diffusion-trajectory validation](#diffusion-trajectory-validation) —
-divergence measured *across denoising steps* rather than on a single forward
-pass. Triton INT8/INT4 kernels that consume packed weights directly are
-planned for v0.3.
+**Every claim below is labelled.** `MEASURED` numbers were produced by the
+scripts in `benchmarks/` on the machine that ran them. `IMPLEMENTED` means the
+code exists and is tested. `FUTURE` means it does not exist yet and nothing
+here reports a benefit from it.
+
+---
+
+## Status at a glance
+
+| Capability | State |
+|---|---|
+| Symmetric groupwise INT8 weight quantization | IMPLEMENTED |
+| **Genuinely packed INT4** (two values per byte) | IMPLEMENTED, MEASURED |
+| MSE-optimal scale search (INT4 error, zero extra bytes) | IMPLEMENTED, MEASURED |
+| Real resident-memory reduction (`PACKED` mode) | IMPLEMENTED, MEASURED |
+| Self-contained checkpoints, no redundant BF16 | IMPLEMENTED, MEASURED |
+| Structural expert targeting + audit trail | IMPLEMENTED |
+| Storage & numerical-error benchmarks | IMPLEMENTED, MEASURED |
+| MoE roofline / tokens-per-expert analysis | IMPLEMENTED, MEASURED |
+| Trajectory capture, trace, offline replay, noise floor | IMPLEMENTED |
+| Router top-k capture from the real fused block | IMPLEMENTED |
+| BF16 vs INT4 experiment on the real checkpoint | **WRITTEN, NOT YET RUN** |
+| **Fused INT8/INT4 Triton MoE kernel** | **FUTURE — does not exist** |
+| Latency or throughput speedup | **NOT CLAIMED, NOT MEASURED** |
+
+> **There is no speedup here.** Quantized execution is dequantize-then-matmul,
+> which is *slower* than BF16. What exists today is a capacity win and a
+> correctness/measurement layer. See
+> [Should the kernel be built?](#should-the-kernel-be-built) for whether the
+> fast path is even worth writing.
 
 ---
 
 ## Table of contents
 
-- [Design goals](#design-goals)
-- [Installation](#installation)
+- [What actually happens when you quantize](#what-actually-happens-when-you-quantize)
+- [Execution modes](#execution-modes)
+- [Measured results](#measured-results)
 - [Quick start](#quick-start)
-- [Quantization strategy](#quantization-strategy)
-- [Public API reference](#public-api-reference)
-  - [Configuration](#configuration)
-  - [Model quantization](#model-quantization)
-  - [Checkpoint save / load](#checkpoint-save--load)
-  - [Low-level algorithms](#low-level-algorithms)
-  - [Runtime modules](#runtime-modules)
-  - [Adapters](#adapters)
-  - [Validation](#validation)
-- [Diffusion-trajectory validation](#diffusion-trajectory-validation)
+- [Targeting is explicit](#targeting-is-explicit)
 - [Checkpoint format](#checkpoint-format)
-- [Testing](#testing)
+- [Integrating with the inference repository](#integrating-with-the-inference-repository)
+- [Should the kernel be built?](#should-the-kernel-be-built)
+- [Trajectory validation](#trajectory-validation)
 - [Benchmarks](#benchmarks)
+- [API reference](#api-reference)
+- [Testing](#testing)
 - [Roadmap](#roadmap)
+- [Changes from v0.1](#changes-from-v01)
 - [Legal](#legal)
 
 ---
 
-## Design goals
+## What actually happens when you quantize
 
-- **Explicit, serializable configuration.** Every checkpoint records bits,
-  group size, scale type, packing layout, compute dtype, and provenance.
-- **Reference-first correctness.** A dequantize-then-matmul path defines the
-  numerical contract that future Triton kernels must reproduce.
-- **Drop-in, zero model changes.** The LLaDA adapter quantizes expert weights
-  and stores packed int8 buffers beside them; the model's `fused_moe` calls
-  keep working on the materialized BF16 tensors.
-- **Sensitive layers stay in BF16.** Router, norms, embeddings and the LM head
-  are excluded by default — tiny BF16 differences can flip top-8 expert
-  selection, which makes quality comparisons noisy.
+```
+              QUANTIZATION                          EXECUTION
+   BF16 w1/w2 ──► symmetric groupwise ──► packed INT8   ──► dequantize ──► BF16 GEMM
+                  (zero-point-free)       packed INT4        per access     (current)
+                            │                   │
+                            └── scales ─────────┘                    ┌──► INT8 Triton
+                                                                     │    fused MoE
+                                            future kernel consumes ──┤    (FUTURE)
+                                            packed weights directly  └──► INT4 Triton
+                                                                          fused MoE
+                                                                          (FUTURE)
+```
+
+The reference path (dequantize-then-matmul) defines the numerical contract the
+future kernel must reproduce. It is a *memory* optimization, not a speed one:
+weights are stored small and expanded on use.
 
 ---
 
-## Installation
+## Execution modes
 
-Requires Python >= 3.10, `torch >= 2.0`, `safetensors`.
+Nothing picks between these implicitly, and only one of them saves memory.
 
-```bash
-# Development (editable, recommended):
-git clone https://github.com/Ahmed-Hedhili-se/LLaDA_Quant.git
-cd LLaDA_Quant
-pip install -e .
+### `ExecutionMode.PACKED` (default)
 
-# Or directly from GitHub:
-pip install git+https://github.com/Ahmed-Hedhili-se/LLaDA_Quant.git
+The BF16 `w1`/`w2` Parameters are **deleted**; only packed integers and scales
+stay resident. `block.w1` still works — it is served by a property that
+dequantizes from the packed buffers — so the model repository needs no
+changes and `fused_moe(x, self.w1, self.w2, ...)` keeps running.
 
-# With dev/test extras:
-pip install -e ".[dev]"
-```
+- Resident memory really drops. `state_dict()` contains no BF16 copy.
+- Every access reconstructs, so it is **slower than BF16**.
+- Transient peak during a call is one layer's BF16 weight on top of the
+  packed set — resident savings are model-wide, the peak is per layer.
+- `block.w1 = ...` raises. A silent write into a temporary is the exact
+  failure this mode exists to prevent.
+
+### `ExecutionMode.REFERENCE`
+
+Packed buffers *and* dequantized BF16 Parameters both resident.
+
+- Uses **~1.5x the memory of not quantizing at all**.
+- Runs at BF16 speed with BF16-shaped writable Parameters.
+- For validation only. `QuantizationResult.summary()` says so out loud, and
+  `MemoryComparison.describe()` prints `REGRESSION`.
+
+---
+
+## Measured results
+
+`MEASURED` — `benchmarks/bench_storage.py --num-experts 16 --hidden 1024 --intermediate 512 --layers 2`, BF16 baseline 96.00 MiB:
+
+| bits | mode | packed | resident MiB | vs BF16 | checkpoint MiB | vs BF16 |
+|---|---|---|---|---|---|---|
+| 8 | packed | no | 49.50 | **0.516x** | 49.50 | 0.516x |
+| 8 | reference | no | 145.50 | 1.516x ⚠ larger | 49.50 | 0.516x |
+| 4 | packed | **yes** | 25.50 | **0.266x** | 25.50 | 0.266x |
+| 4 | reference | yes | 121.50 | 1.266x ⚠ larger | 25.50 | 0.266x |
+
+Resident bytes come from walking the live module tree
+(`LLaDA_Quant.memory.resident_memory`), not from the theoretical size of a
+packed tensor.
+
+**INT4 really saves storage**: 0.266x vs INT8's 0.516x — the value bytes are
+exactly halved, and the residual above 0.25x is the fp32 scales, which are
+identical in both.
+
+`MEASURED` — `benchmarks/bench_numerical.py --num-experts 16 --hidden 512 --intermediate 256`,
+Gaussian weights / Student-t(3) weights (`--heavy-tailed`, closer to real LLM tails):
+
+| bits | scale search | weight rel. L2 | output cosine | bytes vs BF16 | error gain |
+|---|---|---|---|---|---|
+| 8 | amax | 0.0065 / 0.0138 | 0.99993 / 0.99971 | 0.516x | — |
+| 8 | mse | 0.0065 / 0.0138 | 0.99993 / 0.99971 | 0.516x | 0.0% |
+| 4 | amax | 0.1174 / 0.2248 | 0.97950 / 0.92650 | 0.266x | — |
+| 4 | **mse** | **0.1011 / 0.1978** | **0.98461 / 0.94128** | 0.266x | **13.9% / 12.0%** |
+
+Error only. Every row executes the same BF16 matmul, so no timing is reported.
+
+**INT4 is the weak link, and scale search narrows it for free.** `s = amax /
+Qmax` spends the whole grid accommodating the single largest weight in a
+group; with 256 levels that is nearly free, with 16 it is not. Searching a
+clipping ratio that minimises per-group squared error cuts INT4 weight error
+by **12–14% at zero extra bytes** — the storage columns above are identical,
+because only the *value* of the scale changes. Enable it with
+`QuantConfig(scale_search="mse")`.
+
+Read the absolute numbers too, not just the gain: even improved, INT4 weight
+error is ~15x INT8's, and output cosine drops to 0.94 on heavy-tailed weights.
+Scale search makes INT4 meaningfully better; it does not make it obviously
+safe. Establishing that needs the trajectory layer against the real
+checkpoint, and probably mixed precision.
+
+### Extrapolated to the real model
+
+`MEASURED` from config (`LLaDA_Quant.analysis.LLADA_MOE_7B_A1B`): expert
+weights are **6.44 B elements** (16 layers x 64 experts), which is most of the
+7B model.
+
+| | expert weights | free on a 24 GB A40-24Q | free on a 48 GB card |
+|---|---|---|---|
+| BF16 | 12.88 GB | 11.12 GB | 35.12 GB |
+| INT8 | 6.44 GB | 17.56 GB | 41.56 GB |
+| INT4 | 3.22 GB | 20.78 GB | 44.78 GB |
+
+On the 24 GB card this is the difference between fitting comfortably and not —
+batch 48 currently fails outright. See
+[Should the kernel be built?](#should-the-kernel-be-built) for why that
+capacity does **not** convert into proportional throughput.
 
 ---
 
 ## Quick start
 
 ```python
-from LLaDA_Quant import (
-    QuantConfig,
-    QuantizationManifest,
-    quantize_model,
-    save_quantized_checkpoint,
-    load_quantized_weights,
-)
+from LLaDA_Quant import QuantConfig, QuantizationManifest, quantize_and_measure, save_quantized_checkpoint
 
-# 1. Configure: INT8, group_size=128, experts + attention linears,
-#    router / norms / embeddings / LM head excluded.
 config = QuantConfig(
-    bits=8,
+    bits=8,                      # or 4 — genuinely packed
     group_size=128,
-    targets=("expert", "linear"),
-    exclude=("router", "norm", "embed_tokens", "lm_head"),
+    targets=("expert",),
+    execution_mode="packed",     # the mode that reduces memory
+    expect_expert_blocks=16,     # fail loudly if the match count is wrong
 )
 
-# 2. Quantize a model in place.
-quantize_model(model, config)
+quantized, result, memory = quantize_and_measure(model, config)
+print(result.summary())
+print(memory.describe())         # measured resident delta, says REGRESSION if it grew
 
-# 3. Save a versioned, provenance-tracked checkpoint (original weights
-#    are never touched).
 save_quantized_checkpoint(
-    model,
+    quantized,
     QuantizationManifest(
         source_checkpoint="hf://inclusionAI/LLaDA-MoE-7B-A1B-Instruct",
         config=config,
+        targets=result.targets,  # the audit trail travels with the artifact
     ),
     "llada-moe-7b-int8-g128",
 )
-
-# 4. Later, in another process, load into a plain (unquantized) model.
-#    Missing packed buffers are registered automatically and w1/w2 are
-#    re-materialized from them.
-load_quantized_weights(model, "llada-moe-7b-int8-g128")
 ```
-
-### How `targets` maps to actions
-
-| `targets` value | Action |
-|---|---|
-| `("expert",)` | Every fused expert block (3-D `w1`/`w2` Parameters, as in `TritonFusedMoEBlock`) gets persistent packed buffers `_qw1`/`_sw1`/`_qw2`/`_sw2`; the live `w1`/`w2` Parameters are replaced by dequantized BF16 values. Router and gating are untouched, so top-k routing is bit-identical. |
-| `("linear",)` | Every matching non-expert `nn.Linear` is swapped for a `QuantLinear` module with the same name, in/out features and bias. |
-| `("expert", "linear")` | Both of the above. |
 
 ---
 
-## Quantization strategy
+## Targeting is explicit
 
-| Component | v0.1 default | Rationale |
+A quantizer that converts the wrong module produces a model that looks fine
+and is wrong, so nothing is matched by guesswork.
+
+**Experts are matched structurally.** Four shape relations pin the fused
+layout; the module's *name* is never consulted:
+
+```
+w1.shape[0] == w2.shape[0]        same expert count E
+w1.shape[1] == 2 * w2.shape[2]    w1 is Gate+Up stacked over I
+w1.shape[2] == w2.shape[1]        both agree on hidden H
+both are 3-D
+```
+
+A module called `mlp` that is a plain `nn.Linear` is not touched; a correctly
+shaped block with an unexpected name is not missed.
+
+**Linears must be named.** `linear_include` has no implicit default — an empty
+tuple quantizes nothing, even with `"linear"` in `targets`:
+
+```python
+QuantConfig(targets=("linear",), linear_include=("q_proj", "k_proj", "v_proj", "o_proj"))
+```
+
+**Exclusions are component globs**, applied per dot-separated path component,
+so `gate` does not silently knock out `gate_proj`. Default:
+`("router", "gate", "*norm*", "embed_tokens", "lm_head")`.
+
+**Failures are loud.** `TargetingError` is raised when zero modules match
+(a silent no-op is indistinguishable from success), or when the count
+disagrees with `expect_expert_blocks` / `expect_linears`. Re-quantizing an
+already-quantized block raises.
+
+Every converted module is recorded in `QuantizationResult.targets` and written
+into the manifest with its shapes, bits, group size, execution mode and
+before/after byte counts.
+
+| Component | Default | Rationale |
 |---|---|---|
-| MoE expert `w1`, `w2` | INT8 (groupwise) | Dominates compute and memory |
-| Attention Q/K/V/O projections | INT8 via `QuantLinear` | Straightforward `nn.Linear` replacement |
-| Router / gate | BF16 (excluded) | Near-uniform scores; tiny changes flip top-k |
-| RMSNorm | BF16 (excluded) | Numerical sensitivity, negligible memory |
-| Embeddings / LM head | BF16 (excluded) | Large but quality-sensitive |
-| KV cache | BF16 | Changes runtime accuracy; separate phase |
+| MoE expert `w1`, `w2` | INT8 or INT4 | ~6.4 B of the ~7 B parameters |
+| Attention projections | opt-in via `linear_include` | must be named explicitly |
+| Router / gate | BF16 (excluded) | near-uniform scores; tiny changes flip top-8 |
+| Norms | BF16 (excluded) | numerically sensitive, negligible memory |
+| Embeddings / LM head | BF16 (excluded) | large but quality-sensitive |
+| KV cache | BF16 | belongs to the inference repo |
 
-Algorithm (symmetric, zero-point-free, per group along K):
+Numerical contract, per group along the last (K) axis:
 
 ```
-W_q = clamp(round(W / s), -Qmax - 1, Qmax)      s = max(|W_group|, 0) / Qmax
+s   = max(|W_group|) / Qmax
+W_q = clamp(round(W / s), -Qmax - 1, Qmax)
+W  ~= W_q * s          (arithmetic in fp32, then cast)
 ```
 
-Groups run along the last axis of a weight tensor, so an expert-stacked tensor
-of shape `[E, N, K]` is quantized per expert and per group with no special
-casing of the expert dimension. If `group_size` does not divide the last
-dimension (or `group_size=-1`), it falls back to per-tensor scaling.
-
----
-
-## Public API reference
-
-### Configuration
-
-`LLaDA_Quant.config.QuantConfig`
-
-```python
-QuantConfig(
-    bits=8,                    # 8 or 4
-    group_size=128,            # -1 = per-tensor fallback
-    targets=("expert",),       # ("expert",), ("linear",) or both
-    exclude=("router", "norm", "embed_tokens", "lm_head"),
-    compute_dtype="bfloat16",  # activation/accumulation dtype
-    scale_dtype="float32",     # scale storage dtype
-    source_checkpoint=None,    # provenance (path or HF id)
-)
-```
-
-Methods: `to_dict()`, `from_dict(data)`, `to_json()`. Every checkpoint
-embeds the full config so a run is reproducible.
-
-### Model quantization
-
-`LLaDA_Quant.api`
-
-| Function | Description |
-|---|---|
-| `quantize_model(model, config) -> list[str]` | Quantize `model` in place. Returns the names of quantized modules/blocks. |
-| `quantized_model(model, config) -> nn.Module` | Non-destructive variant: deep-copies `model` first, then quantizes the clone. |
-| `save_quantized_checkpoint(model, manifest, directory)` | Write `model-int8.safetensors` + `quantization.json` + `source-checkpoint.json`. |
-| `load_quantized_weights(model, directory, strict=True) -> QuantizationManifest` | Load a checkpoint into a model (plain or already-quantized). Registers missing packed buffers and re-materializes `w1`/`w2`. |
-
-### Checkpoint save / load
-
-`LLaDA_Quant.formats.safetensors`
-
-| Function | Description |
-|---|---|
-| `save_quantized_checkpoint(model, manifest, directory)` | Full artifact (tensors + manifests). |
-| `load_quantized_checkpoint(directory) -> (state_dict, manifest)` | Raw tensors + manifest, without touching any model. |
-| `load_quantized_weights(model, directory, strict=True)` | Model-level load (see above). |
-
-`LLaDA_Quant.formats.manifest`
-
-- `QuantizationManifest(format_version, framework_version, created_at, source_checkpoint, config, entries)` — `to_dict()`, `from_dict()`, `to_json()`, `save(directory)`.
-- `QuantEntry(tensor_name, shape, bits, group_size, storage_dtype, compute_dtype, source_tensor, sha256)` — per-tensor metadata.
-- `tensor_hash(tensor) -> str` — deterministic SHA-256 of tensor values.
-
-### Low-level algorithms
-
-`LLaDA_Quant.algorithms.symmetric`
-
-| Function | Description |
-|---|---|
-| `quantize_tensor(w, bits=8, group_size=128, scale_dtype=float32) -> QuantResult` | Quantize along the last axis. |
-| `dequantize_tensor(q, scale, bits, group_size, dtype=float32)` | Reconstruct `w ~= q * scale` (arithmetic in fp32, then cast — preserves scale precision in BF16). |
-| `qmax_for_bits(bits) -> int` | Largest positive representable value. |
-| `pack_int4(q8) -> int8` / `unpack_int4(packed)` | Two's-complement nibble packing along the last axis. |
-
-`QuantResult` (`q`, `scale`, `bits`, `group_size`) exposes `dequantize(dtype)`.
-
-### Runtime modules
-
-`LLaDA_Quant.runtime.linear.QuantLinear`
-
-```python
-QuantLinear(in_features, out_features, bits=8, group_size=128,
-            compute_dtype=torch.bfloat16, bias=False, scale_dtype=torch.float32)
-# from an existing module:
-QuantLinear.from_linear(linear, bits=8, group_size=128, compute_dtype=torch.bfloat16)
-# access the reconstructed weight:
-w = qlin.dequantize_weight()
-```
-
-Call semantics are identical to `nn.Linear`: `out = qlin(x)` returns a
-BF16 tensor of shape `(..., out_features)`. Storage: `qweight`
-`[out_features, in_features]` int8, `scale` `[out_features, num_groups]`.
-
-`LLaDA_Quant.runtime.moe`
-
-| Function / class | Description |
-|---|---|
-| `QuantExpertWeights(w1: QuantResult, w2: QuantResult)` | Container for one layer's packed fused `w1`/`w2`. |
-| `QuantExpertWeights.quantize(w1, w2, bits, group_size, scale_dtype)` | Quantize a fused pair. |
-| `QuantExpertWeights.dequantize(dtype) -> (w1, w2)` | Reconstruct both tensors. |
-| `quantize_fused_experts(w1, w2, bits=8, group_size=128)` | Convenience wrapper. |
-| `materialize_expert_params(module, weights, compute_dtype)` | Copy dequantized values into `module.w1` / `module.w2`. |
-
-### Adapters
-
-`LLaDA_Quant.adapters.llada_moe` (LLaDA-specific, targets `TritonFusedMoEBlock`)
-
-| Function | Description |
-|---|---|
-| `is_fused_expert_block(module) -> bool` | Detects a block with 3-D `w1`/`w2` Parameters (w1 with even second dim). |
-| `quantize_llada_experts(model, config) -> list[str]` | Quantize all fused expert blocks in place; registers `_qw1/_sw1/_qw2/_sw2` buffers. |
-| `restore_llada_experts_from_buffers(model, config)` | Re-materialize `w1`/`w2` from the packed buffers. |
-
-`LLaDA_Quant.adapters.torch` (generic)
-
-| Function | Description |
-|---|---|
-| `replace_linears(model, config) -> list[str]` | Swap matching non-excluded `nn.Linear` modules for `QuantLinear`. |
-
-### Validation
-
-`LLaDA_Quant.validation.metrics`
-
-| Function | Description |
-|---|---|
-| `max_abs_error(a, b)` / `mean_abs_error(a, b)` | Absolute error statistics. |
-| `max_rel_error(a, b, eps=1e-6)` | Relative error (flattened). |
-| `cosine_similarity(a, b)` | Cosine similarity of flattened tensors. |
-| `router_overlap(topk_ids_a, topk_ids_b) -> float` | Fraction of (token, rank) slots where two routings agree — the key diagnostic for this codebase. |
-| `summarize_metrics(a, b) -> dict` | All of the above in one dict. |
-| `top1_agreement(a, b, positions=None) -> float` | Fraction of positions predicting the same token id. |
-| `kl_divergence(ref, other, positions=None) -> float` | Mean `KL(ref ‖ other)` in nats. |
-| `unmask_selection_agreement(a, b, mask_positions, k=1) -> float` | Overlap of the positions each model would unmask next. |
-| `top2_margin(logits, positions=None) -> float` | How decisive the reference is. |
-| `tie_fraction(ref, other, positions=None) -> float` | Share of positions where the reference's margin is below the quantization shift. |
-
-`LLaDA_Quant.validation.compare.compare_models(reference, quantized, components, get_inputs_fn, forward_fn, router_fn, dtype) -> dict[str, ComponentReport]`
-
-Compares named submodules of two models on identical inputs; `ComponentReport`
-carries the metrics plus `router_overlap`. `forward_fn(module, inputs)` and
-`router_fn(module, inputs)` are supplied by you.
-
-> Do not use text equality as your only gate: small numerical perturbations
-> change diffusion trajectories. Track logit similarity and per-layer router
-> overlap instead.
-
----
-
-## Diffusion-trajectory validation
-
-`compare_models` answers *how wrong is this layer on one forward pass* — the
-standard PTQ question, and one that is structurally blind to how a masked
-diffusion LM actually fails. A small logit shift changes **which position gets
-unmasked**; that position becomes context for every later step; the error
-compounds along the schedule. `LLaDA_Quant.validation.trajectory` measures
-that directly.
-
-The boundary from [Design goals](#design-goals) is unchanged: **no decoding
-logic lives here.** You pass callables, and your inference repository keeps
-owning the forward pass, the router internals and the unmasking rule.
-
-### Building denoising states
-
-`LLaDA_Quant.validation.diffusion`
-
-| Function | Description |
-|---|---|
-| `DiffusionState(step, input_ids, mask_positions, attention_mask=None, label="")` | One point on a trajectory. `num_masked` / `mask_ratio` / `describe()`. |
-| `fully_masked_state(prompt_ids, gen_length, mask_token_id)` | Prompt + all-mask generation region: the trajectory start. |
-| `make_masked_states(prompt_ids, completion_ids, mask_token_id, ratios=..., generator=None)` | A **monotone** early/middle/late schedule — positions are only ever revealed, never re-masked, so state *i+1*'s masked set is a strict subset of state *i*'s. |
-| `mask_positions_from_ids(input_ids, mask_token_id)` | Boolean mask helper. |
-
-### The two entry points
-
-| Function | What it isolates |
-|---|---|
-| `compare_trajectory(reference, quantized, states, logits_fn, router_fn=None, unmask_k=1, masked_positions_only=True)` | **Teacher-forced.** Both models see byte-identical inputs, so every difference is quantization alone. Shows per-step sensitivity; by construction cannot show compounding. |
-| `compare_free_running(reference, quantized, initial_state, logits_fn, advance_fn, max_steps=64)` | **Self-driven.** Each model denoises with its own logits through *your* unmasking rule. Inputs drift apart — that is the point. This is where compounding becomes visible. |
-
-Callbacks you supply:
-
-```python
-logits_fn(model, state)   -> Tensor [B, L, vocab]
-router_fn(model, state)   -> Tensor | {layer_name: Tensor} | None   # top-k expert ids
-advance_fn(state, logits) -> DiffusionState | None                  # your unmasking rule
-```
-
-```python
-from LLaDA_Quant import (
-    QuantConfig, quantized_model, make_masked_states, compare_trajectory,
-)
-
-reference = load_llada_moe()                       # your BF16 model
-quantized = quantized_model(reference, QuantConfig(bits=8, group_size=128))
-
-states = make_masked_states(prompt_ids, completion_ids, mask_token_id=MASK_ID,
-                            ratios=(1.0, 0.75, 0.5, 0.25, 0.1))
-
-report = compare_trajectory(
-    reference, quantized, states,
-    logits_fn=lambda m, s: m(s.input_ids).logits,
-    router_fn=lambda m, s: collect_topk_ids(m),    # from your own hooks
-    unmask_k=block_size,                           # match your decoder
-)
-print(report.to_table())
-json.dump(report.to_dict(), open("trajectory-int8.json", "w"))
-```
-
-`TrajectoryReport` gives `states`, `series(key)` (the degradation *shape* in
-step order), `worst_state`, `min_router_overlap`, `to_table()`, `to_dict()`.
-`FreeRunReport` gives `steps`, `first_divergence_step`, `final_token_agreement`
-and the two final id tensors.
-
-### Reading the numbers
-
-Per state: `top1_agreement`, `unmask_agreement`, `kl_masked`, per-layer
-`router_overlap`, plus the standard logit metrics restricted to masked slots.
-
-Two of these carry the load. **`unmask_agreement`** catches models that agree
-on every predicted token yet unmask in a different order — invisible to top-1
-agreement, but it changes the context all later steps condition on.
-**`tie_fraction`** guards against over-reading the rest: it reports the share
-of positions where the *reference's own* top-2 margin is smaller than the
-logit shift quantization introduced. Disagreement there is a coin-toss on a
-tie, not damage.
-
-That guard is not hypothetical. On the toy model in the test suite, INT8
-scores `top1_agreement = 0.0` at the fully masked state — with
-`tie_fraction = 1.0`, because the reference's margin is ~1e-5 against ~5e-3 of
-INT8 noise. Reported alone, the first number looks catastrophic and means
-nothing. **Never quote an agreement number without its tie fraction.**
+INT4 packs element `2i` into the low nibble and `2i+1` into the high nibble,
+two's complement. Group boundaries stay byte-aligned because every legal
+group size is even — enforced by `QuantConfig`, which rejects an odd
+`group_size` at `bits=4`.
 
 ---
 
@@ -370,14 +269,473 @@ nothing. **Never quote an agreement number without its tie fraction.**
 
 ```
 llada-moe-7b-int8-g128/
-├─ model-int8.safetensors      packed ints + scales + materialized params
-├─ quantization.json           manifest: config, entries, framework version
+├─ model-int8.safetensors      packed ints + scales + untargeted tensors
+├─ quantization.json           config, targeting audit, measured totals
 └─ source-checkpoint.json      pointer + SHA-256 of the unquantized source
 ```
 
-The original Hugging Face checkpoint is never mutated. Loading into a *plain*
-model works too: missing packed buffers are registered automatically and
-`w1`/`w2` are re-materialized from them.
+The artifact is self-contained and **contains no BF16 copy of a quantized
+weight** in either execution mode. Those tensors are re-derived on load, so
+storing them made the "quantized" checkpoint 1.52x the size of the
+unquantized one. Their absence at load time is expected and never counts as a
+missing key; any *other* missing or unexpected key still raises.
+
+Loading into a plain model works: packed buffers are registered on the fly and
+expert access is re-installed. The effective group size is recovered from the
+scale tensor's shape rather than the config, because `quantize_tensor` falls
+back to per-tensor scaling when the group size does not divide K — trusting
+the config there would dequantize with the wrong grouping and produce garbage
+of exactly the right shape.
+
+---
+
+## Integrating with the inference repository
+
+Verified against `test_llada` by inspection at `fbc1cae` (not yet executed —
+that needs a GPU with Triton and the weights).
+
+**What matches.** `TritonFusedMoEBlock` (`model_update/model.py:103`) declares
+`w1 [num_local_experts, 2*EI, H]` and `w2 [num_local_experts, H, EI]`, which
+satisfies all four structural relations, so detection finds it with no name
+matching. Its path is `layers.{i}.mlp`; `mlp` is not excluded, while the
+block's own `gate` (the router) is. `forward` passes `w1=self.w1, w2=self.w2`
+into `fused_moe`, so the PACKED property is transparent there, and the kernel
+wants BF16, which is what `compute_dtype` produces.
+
+**Order matters.** `load_state_dict_from_unfused` does `self.w1[i].copy_(...)`
+— an in-place write that PACKED mode would send into a dequantized temporary.
+Quantize *after* the fused block is populated:
+
+```python
+MODEL = LLaDAMoEKV(use_fused_moe=False).to(torch.bfloat16).eval()
+# ... load HF weights, build fused blocks, call load_state_dict_from_unfused ...
+quantize_model(MODEL, QuantConfig(bits=8, group_size=128, targets=("expert",),
+                                  execution_mode="packed", expect_expert_blocks=16))
+```
+
+Getting this backwards raises rather than silently doing nothing: the packed
+subclass shadows every method in `WEIGHT_MUTATING_METHODS` with an error that
+names the fix.
+
+**Cost on the real model.** Each layer holds 402.7 M expert elements. A BF16
+step reads 805 MB of expert weights per layer; PACKED INT8 reads 403 MB of
+int8, writes 805 MB of BF16, then the GEMM reads it back — about **2.5x the
+memory traffic**. That is the price of the capacity win until a kernel consumes
+packed weights directly, and it is why PACKED is a *fit-the-model* tool today,
+not a speed one.
+
+**The kernel a future low-bit path would extend has changed.** As of
+`b4872e9..fbc1cae` the inference repo folds SiLU into GEMM1's epilogue. This
+does **not** affect anything above — `w1 [E, 2I, H]`, `w2 [E, H, I]`, the
+in-place loader and `w1=self.w1` in `forward` are unchanged, so detection, both
+residency modes and the checkpoint format are unaffected. It does change what a
+dequantizing kernel must do:
+
+| | Before | After (`SILU_EPILOGUE=True`) |
+|---|---|---|
+| `N` kernel arg | `2*EI` | `EI` (output width) |
+| B tiles in flight per K step | 1 | **2** (gate at `offs_bn`, up at `offs_bn + N`) |
+| GEMM1 output | `[M, top_k, 2*EI]` | `[M*top_k, EI]` |
+| Shared memory | `(BM·BK + BK·BN)·stages·2` | `(BM·BK + 2·BK·BN)·stages·2` |
+
+Groups run along K, orthogonal to the gate/up split along N, so the scale
+layout stays compatible — but a dequantizing kernel fetches scales for *two*
+N-tiles per K step and register pressure roughly doubles. `SILU_EPILOGUE`
+applies to GEMM1 only, so an INT8 path needs two dequant variants, not one.
+
+Two helpers exist for this, because both are silent-failure risks:
+
+```python
+from LLaDA_Quant.algorithms.symmetric import validate_block_k_alignment, aligned_block_k_values
+from LLaDA_Quant.analysis import kernel_shared_memory_bytes
+
+validate_block_k_alignment(block_k=96, group_size=128)   # raises: straddles a group
+aligned_block_k_values(128, [32, 64, 96, 128, 256])      # -> [32, 64, 128, 256]
+kernel_shared_memory_bytes(16, 128, 64, 2, weight_bytes=0.5, b_tiles=2)  # packed INT4
+```
+
+`validate_block_k_alignment` exists because nothing in a Triton kernel enforces
+that `BLOCK_SIZE_K` and `group_size` divide each other; an autotuner free to
+pick `BK=96` against `group_size=128` produces a kernel that dequantizes part
+of every tile with the wrong scale and returns plausible, wrong numbers.
+`kernel_shared_memory_bytes` generalises the inference repo's `_shmem_bytes`,
+which hardcodes 2 bytes per element — using that for INT8/INT4 over-estimates
+the budget and silently rejects configs that would have fit.
+
+Also: the kernel declares `a_scale_ptr`, `b_scale_ptr`, `use_fp8_w8a8` and
+`use_int8_w8a16`, all inherited from vLLM, all passed `None`/`False`, and none
+referenced in the body. They look like working plumbing and are not.
+
+**Not covered.** `use_fused_moe=False` (the unfused `MoEBlock`/`ExpertMLP`
+path) exposes `gate_proj`/`up_proj`/`down_proj` Linears, not fused tensors —
+the expert adapter finds nothing there and raises `TargetingError`; quantize it
+with `linear_include` instead. Under tensor parallelism each rank holds
+`num_local_experts`, so detection works per rank but checkpoints become
+rank-specific. `TritonFusedMoEBlock.forward` raises on CPU, so Mode A/B against
+the real model needs a GPU. A low-bit kernel needs its own
+`moe_tune_config.json`: it is hardware- and variant-specific, deliberately
+untracked, and on a machine that had never been tuned it was worth more (2.2x
+at M=2048) than either kernel change.
+
+---
+
+## Should the kernel be built?
+
+`MEASURED` — analytic side from `benchmarks/bench_moe_regime.py`; the measured
+side from the inference repository, recorded in
+[INFERENCE_REPO_CHANGES.md](INFERENCE_REPO_CHANGES.md) on a single **NVIDIA
+A40-24Q** (sm_86, 24 GB, ~696 GB/s) running the real 7B checkpoint.
+
+Weight-only quantization buys latency only where the GEMM is bandwidth-bound.
+For a top-k MoE the deciding quantity is **tokens per expert per step** =
+`M * top_k / E`, which for LLaDA-MoE is `M / 8`. LLaDA's cached decoder
+forwards `x[:, block_start:]`, so `M = batch x suffix_length`.
+
+A40-24Q balance: 215 flops/byte BF16, 430 INT8.
+
+| workload | tokens/step | M/expert | BF16 | W8A16 | W4A16 |
+|---|---|---|---|---|---|
+| batch=1, first block (L=128) | 128 | 16 | memory | memory | memory |
+| batch=1, last block (L=32) | 32 | 4 | memory | memory | memory |
+| batch=4, first block | 512 | 64 | memory | memory | **compute** |
+| batch=16, first block | 2048 | 256 | **compute** | **compute** | **compute** |
+| batch=32, last block | 1024 | 128 | memory | **compute** | **compute** |
+| batch=57, first block | 7296 | 912 | **compute** | **compute** | **compute** |
+
+Crossover M/expert (bandwidth-bound below): **BF16 215, W8A16 108, W4A16 54,
+W8A8 215.**
+
+### The bandwidth-bound premise is confirmed `MEASURED`
+
+Nsight Compute on `fused_moe_kernel` at batch 32: L2 throughput 96.35%, DRAM
+66.40%, SM 41.25%. End to end from a profiler trace (batch 11, 32 tokens, 32
+steps): 438 GB of expert weights streamed, a 626 ms floor at ~696 GB/s against
+**770 ms measured** — **81% of theoretical weight-streaming peak**, and 58.75%
+of all GPU time. Every expert is touched every forward (352 tokens x top-8 =
+2,816 assignments over 64 experts).
+
+**Halving weight bytes should translate close to directly into time in this
+regime.** That is the strongest argument for the kernel, and it is measured
+rather than modelled.
+
+The model called it correctly, by two independent routes: at that traced
+workload M/expert = 352 x 8 / 64 = **44**, well below the BF16 crossover of
+215 → predicted memory-bound, measured at 81% of peak. A direct
+arithmetic-intensity check gives 35.4 GFLOP / 805 MB = 44 FLOP/byte against a
+215 FLOP/byte balance — same verdict.
+
+> One figure that circulated as "~96% of peak memory bandwidth" is **L2, not
+> DRAM**. Nsight's Speed-of-Light row reports the most-utilised memory
+> subsystem. Read as a DRAM ceiling it says "nothing left to gain"; read as an
+> L2 ceiling it says "remove intermediate traffic" — which is what produced
+> the inference repo's SiLU epilogue.
+
+### The capacity → throughput argument does *not* hold `MEASURED`
+
+A previous version of this section claimed that in the compute-bound regime
+the win is capacity: free memory → larger batch → more throughput. **That has
+now been measured and it saturates early.** Throughput vs `BATCH_MAX_SIZE`,
+A40-24Q, 128 tokens / steps=128 / block=32:
+
+| `BATCH_MAX_SIZE` | Tok/s | Δ throughput | Δ batch | p50 latency |
+|---:|---:|---:|---:|---:|
+| 8 | 150.3 | — | — | 6.77 s |
+| 16 | 204.8 | +36.3% | +100% | 9.93 s |
+| 24 | 224.8 | +9.8% | +50% | 13.56 s |
+| 32 | 243.2 | +8.2% | +33% | 16.71 s |
+| 48 | 0/96 requests succeeded | — | — | — |
+
+8 → 32 is **4x the batch for 1.62x the throughput**, and the last step bought
+8.2%. The curve is past its knee by batch 32. So freeing memory to roughly
+double the batch is worth **single-digit percent** throughput, not a multiple.
+
+Capacity is still a real win for *fitting* a model or a longer context — on a
+24 GB card BF16 experts alone are 12.88 GB, and batch 48 fails outright — but
+it is weak as a *throughput* mechanism. The knee moves on a 48 GB card; the
+shape of the curve should not, because it is the same mechanism the `M/expert`
+analysis describes: past the crossover, extra tokens stop riding along free.
+
+### Verdict
+
+At the inference repo's actual operating point (batch 32, block 32 → M = 1024,
+M/expert = 128):
+
+- **BF16**: 128 < 215 → memory-bound. Confirmed at 81% of peak.
+- **W8A16**: 128 > 108 → compute-bound *once quantized*. The weight-only
+  kernel would deliver well under its 2x ceiling here.
+- **Batch 1–16** (M/expert 4–64): memory-bound before *and* after quantizing.
+  This is where a W8A16/W4A16 fused kernel gets close to its full ratio.
+
+The trap this section already flagged — quantizing halves the crossover, so a
+bandwidth-bound workload can become compute-bound once quantized — is exactly
+what happens at the throughput operating point.
+
+**So: build the kernel for latency-oriented, small-batch serving. Its case is
+weakest in the high-batch throughput regime**, which inverts the common
+intuition that quantization is a throughput play. If the target moves to H100,
+re-run all of this: ~3.35 TB/s against much higher INT8 throughput shifts every
+crossover, and native FP8 changes the arithmetic entirely.
+
+### Routing balance is still unmeasured
+
+Rows assume perfectly balanced routing, which is optimistic — the slowest
+expert bounds the step. The checkpoint's router is documented as near-uniform
+(top-1 weight ~1.7–5%), so imbalance is probably mild, but nobody has measured
+it. `topk_ids` is available in `TritonFusedMoEBlock.forward` immediately after
+`torch.topk(routing_weights, self.cfg.TOPK, dim=-1)`:
+
+```bash
+python benchmarks/bench_moe_regime.py --routing-file topk_ids.pt
+```
+
+or call `LLaDA_Quant.analysis.expert_token_stats(topk_ids, num_experts)`
+in-process for min/p50/mean/p90/p99/max and the imbalance ratio.
+
+---
+
+## Trajectory validation
+
+```
+MODEL ──► CAPTURE ──► TRACE ──► METRICS ──► REPORT
+          (GPU)       (JSON)    (offline)   (offline)
+```
+
+Only `trajectory.capture` touches a model. Everything downstream runs from a
+JSON trace, so metrics can be recomputed and unit-tested without rerunning
+anything.
+
+### Two modes, never conflated
+
+| Mode | What it measures | What it cannot show |
+|---|---|---|
+| **A — shared state** (`capture_shared`) | Error *injected per step*. Both models see byte-identical states, so every difference is quantization. | Amplification, by construction. |
+| **B — free running** (`capture_free_running`) | *Amplified* end-to-end divergence. Each model advances itself through your commit rule. | Per-step error — once inputs drift, a logit distance conflates two causes. |
+
+Mode B stores no pairwise logit scalars for exactly that reason.
+
+### The noise floor is mandatory
+
+Before comparing BF16 against INT8, compare **BF16 against BF16**. Non-
+determinism, batch composition and kernel selection move that floor off zero.
+`TrajectoryReport.to_table()` renders a `BF16 floor` column next to every
+result, and derives `per_step_signal` (Mode A above floor) and
+`amplification` (Mode B ÷ Mode A).
+
+For stochastic decoding use `temperature=0.0`, or share RNG draws. Two
+independent gumbel draws produce divergence that has nothing to do with
+quantization.
+
+### Traces stay compact and honestly labelled
+
+Full logits for LLaDA are `[B, L, 157184]` — ~40 MB per step per model. So
+anything needing the full vocabulary is reduced **on device during capture**
+and stored as a scalar; everything else is stored top-k truncated. Every
+scalar carries a `MetricPrecision`:
+
+- `EXACT` — reduced over the full tensor (cosine, KL, top-1 agreement, tie
+  fraction, router overlap)
+- `TOPK` — computed from the stored top-k slice (`topk_set_overlap`,
+  `topk_kl_lower_bound`, which is a *lower bound*, not KL)
+- `SAMPLED` — estimated from a subset
+
+`verify_replay()` cross-checks replayed numbers against the exact ones
+captured on device, so the offline path and the capture code cannot drift
+apart unnoticed.
+
+### Metrics
+
+Beyond error and cosine: `top1_agreement`, `kl_divergence`,
+`predictive_entropy`, `router_overlap`, **`router_margin`** (gap between the
+k-th and (k+1)-th gate — whether quantization noise can flip expert
+selection), **`unmask_selection_agreement`** (do both models unmask the *same
+position* next — invisible to top-1 agreement, but it changes the context
+every later step conditions on), `commit_order_agreement`, and
+**`tie_fraction`**.
+
+> **Never quote an agreement number without its tie fraction.** `tie_fraction`
+> is the share of positions where the reference's own top-2 margin is smaller
+> than the shift quantization introduced — the argmax may flip, but there was
+> no preference to destroy. On the toy model in the test suite INT8 scores
+> `top1_agreement = 0.0` at the fully masked state with `tie_fraction = 1.0`,
+> because the reference's margin is ~1e-5 against ~5e-3 of INT8 noise. Alone,
+> the first number looks catastrophic and means nothing.
+
+### Two-tier acceptance, and what the reference is
+
+Method borrowed from the inference repo's SiLU-epilogue validation
+([INFERENCE_REPO_CHANGES.md](INFERENCE_REPO_CHANGES.md) §5), which transfers
+directly to validating a future low-bit kernel against this package's
+dequantize-then-matmul path:
+
+- **Tier A, hard assert** — generated token sequences identical to a frozen
+  reference run. This is what must hold.
+- **Tier B, reported** — elementwise bit-exactness, printed with a real
+  diagnostic (`n_differing`, `max_rel`) on failure rather than an opaque
+  assert.
+
+The subtlety worth stealing: for a low-bit kernel **Tier B legitimately
+fails** — a different numeric is the whole point — but Tier A generalises once
+you pick the right reference. A packed kernel should be gated on reproducing
+the *reference path's* tokens, not BF16's. That is a far stronger check than
+cosine similarity on logits, and Mode B already produces exactly the artifact
+it needs: run `capture_free_running(reference_path_model, kernel_model, ...)`
+and require `final_token_agreement == 1.0`.
+
+Gate on the real task as well. GSM8K n=50 seed=42 scored 88.0% before and
+after that change; that is the acceptance bar an accuracy-affecting change
+should clear. Treat it as a *comparison* baseline rather than an absolute —
+3 of the 44 correct answers rest on a last-number-in-the-response grading
+fallback.
+
+### Getting routing out of the real block
+
+`TritonFusedMoEBlock` computes `topk_ids` inside `forward` and never returns
+it, so router overlap needs `RouterCapture`: a forward **pre**-hook stashes
+each block's input and recomputes the routing with the block's own operations —
+
+```python
+x_flat   = x.reshape(-1, H)
+routing  = softmax(block.gate(x_flat), dim=-1, dtype=float32)
+topk_ids = routing.topk(TOPK).indices
+```
+
+— which is bit-identical because it is the same ops on the same tensors. The
+router is an excluded BF16 `nn.Linear` running *before* the experts, so its
+weights are identical in both models and **every overlap below 1.0 is
+attributable to the hidden state drifting upstream**, never to the router
+itself being damaged. A test pins that.
+
+Attach one capture per model and dispatch by identity — `capture_shared` runs
+both models, so a single shared registry would let the second overwrite the
+first:
+
+```python
+ref_cap, qnt_cap = attach_router_capture(bf16), attach_router_capture(int4)
+capture_shared(bf16, int4, states, logits_fn,
+               router_fn_for(ref_cap, qnt_cap), gates_fn_for(ref_cap, qnt_cap))
+```
+
+### The decoder is not reimplemented
+
+`trajectory.llada` imports `add_gumbel_noise`, `get_num_transfer_tokens` and
+`select_transfer_indices` from the inference repo's `model_update/generate.py`
+and assembles `advance_fn` from those exact functions. No LLaDA decoding
+semantics are restated. `assert_matches_production_decoder()` proves one step
+of the adapter equals the production primitives for a deterministic case — a
+measurement built on a drifted reimplementation is worse than no measurement.
+
+```python
+from LLaDA_Quant.trajectory import load_llada_decoder, make_llada_advance_fn, capture_free_running
+
+decoder = load_llada_decoder("/path/to/test_llada")     # imports, never modifies
+advance = make_llada_advance_fn(decoder, steps=32, temperature=0.0)
+capture = capture_free_running(reference, quantized, start, logits_fn, advance)
+capture.save("traces/")
+```
+
+---
+
+## Benchmarks
+
+Three categories, each stating what it measures and what it does not.
+
+| Script | Category | Measures | Explicitly does **not** measure |
+|---|---|---|---|
+| `bench_storage.py` | A — storage | resident tensor bytes, checkpoint bytes | any latency |
+| `bench_numerical.py` | B — numerical | weight and output quantization error | latency — both paths run the same BF16 matmul |
+| `bench_moe_regime.py` | decision | tokens/expert, GEMM shapes, roofline side | wall-clock anything |
+| `bench_bf16_vs_int4.py` | validation | BF16 vs INT4-MSE on the **real** checkpoint: router overlap, token commits, final output, against a BF16-vs-BF16 floor | latency; needs a GPU, never yet run |
+| *(none yet)* | C — kernel | BF16 vs INT8 vs INT4 fused MoE | **the kernel does not exist** |
+| *(none yet)* | D — end to end | tokens/s, latency, memory, batch, steps | needs the inference repo and a GPU |
+
+`v0.1`'s `bench_experts.py` was **deleted**: it dequantized to BF16 and then
+timed the same BF16 computation twice, reporting the difference as an INT8
+result, and computed "47% memory saving" from packed tensors while the BF16
+copies were still resident.
+
+---
+
+## API reference
+
+### Configuration
+
+```python
+QuantConfig(
+    bits=8,                      # 8 or 4 (4 is genuinely packed)
+    group_size=128,              # -1 = per-tensor; must be even at bits=4
+    targets=("expert",),         # "expert", "linear"
+    execution_mode="packed",     # "packed" (saves memory) or "reference" (validation)
+    linear_include=(),           # explicit globs; empty matches nothing
+    exclude=("router", "gate", "*norm*", "embed_tokens", "lm_head"),
+    compute_dtype="bfloat16",
+    scale_dtype="float32",
+    scale_search="amax",       # or "mse": lower INT4 error, same bytes
+    search_grid=24,            # candidate clipping ratios; 8 captures most of it
+    source_checkpoint=None,
+    expect_expert_blocks=None,   # assert the match count
+    expect_linears=None,
+    allow_no_matches=False,      # tests only
+)
+```
+`.mode`, `.reduces_memory`, `.to_dict()`, `.from_dict()`, `.to_json()`.
+
+### Quantization
+
+| Function | Description |
+|---|---|
+| `quantize_model(model, config) -> QuantizationResult` | In place. Raises `TargetingError` on an unexpected match set. |
+| `quantized_model(model, config) -> nn.Module` | Deep-copies first. |
+| `quantize_and_measure(model, config) -> (model, result, MemoryComparison)` | Quantize a clone and measure the resident delta against the original. |
+
+`QuantizationResult`: `targets`, `names`, `expert_blocks`, `linears`,
+`source_bytes`, `quantized_bytes`, `weight_ratio`, `summary()`.
+
+### Memory
+
+| Function | Description |
+|---|---|
+| `resident_memory(module) -> MemoryReport` | Live tensors, shared storages counted once. |
+| `compare_resident_memory(baseline, quantized) -> MemoryComparison` | `ratio`, `saved_bytes`, `is_saving`, `describe()`. |
+
+### Checkpoints
+
+`save_quantized_checkpoint`, `load_quantized_weights`,
+`load_quantized_checkpoint`, `checkpoint_size_bytes`, `find_weights_file`,
+`derivable_tensor_names`.
+
+### Algorithms
+
+`quantize_tensor(w, bits, group_size, scale_dtype, pack=True)`,
+`dequantize_tensor(q, scale, bits, group_size, dtype, packed)`,
+`search_group_scale` (MSE-optimal clipping),
+`pack_int4`, `unpack_int4`, `validate_int4_layout`, `storage_bytes`,
+`qmax_for_bits`, `qmin_for_bits`, `block_k_is_scale_aligned`,
+`validate_block_k_alignment`, `aligned_block_k_values`. `QuantResult` carries `q`, `scale`, `bits`,
+`group_size`, `packed`, `logical_shape`, `dequantize()`, `storage_bytes()`.
+
+### Runtime
+
+`QuantLinear` (drop-in for `nn.Linear`, INT8 and packed INT4),
+`QuantExpertWeights`, `attach_packed_buffers`,
+`install_packed_expert_access`, `is_packed_expert_block`,
+`quant_result_from_buffers`, `materialize_expert_params`.
+
+### Analysis
+
+`MoEShape`, `LLADA_MOE_7B_A1B`, `Machine`, `A40_24Q` (default), `A40`,
+`RTX_A6000`, `A100_80GB`, `H100_SXM`, `SCHEMES`, `Workload`,
+`expert_token_stats`, `ideal_tokens_per_expert`, `gemm_regime`,
+`crossover_m`, `regime_sweep`, `suffix_lengths_for_schedule`,
+`kernel_shared_memory_bytes`, `shared_memory_headroom`.
+
+### Trajectory
+
+`DiffusionState`, `make_masked_states`, `fully_masked_state`;
+`RouterCapture`, `attach_router_capture`, `router_fn_for`, `gates_fn_for`;
+`capture_shared`, `capture_free_running`; `Trace`, `TraceStep`,
+`ScalarMetric`, `MetricPrecision`; `replay_shared`, `replay_free_running`,
+`verify_replay`; `TrajectoryReport`; `load_llada_decoder`,
+`make_llada_advance_fn`, `assert_matches_production_decoder`.
 
 ---
 
@@ -388,61 +746,71 @@ pip install -e ".[dev]"
 pytest tests
 ```
 
-Test layers:
+`MEASURED`: **198 passed, 1 skipped** (the skip binds to the real inference
+repo, which needs Triton and CUDA).
 
-| Level | What is checked |
+| File | Covers |
 |---|---|
-| Unit | quantize/dequantize error bounds, int4 pack roundtrip, `QuantLinear` vs `nn.Linear`, adapter buffer registration, manifest JSON roundtrip, checkpoint save/load, router-overlap metric |
-| Component | one fused MoE layer output error vs BF16 reference |
-| Trajectory | monotone schedule construction, masked-token metrics, teacher-forced and free-running divergence on a toy masked diffusion LM |
-| Regression / E2E | planned: fixed prompts + seeds, routing overlap, task accuracy, memory, tokens/sec |
-
----
-
-## Benchmarks
-
-```bash
-python benchmarks/bench_experts.py --num-experts 64 --hidden 2048 --intermediate 1024
-```
-
-Produces a JSON report with BF16 vs INT8 latency and weight-memory footprint
-(INT8 weight memory is ~47% of BF16). v0.1 measures the reference
-(dequantize-then-matmul) path; the packed Triton kernel will be benchmarked
-with the same CLI in v0.3.
-
-Planned matrix (fixed schedule + hardware):
-
-| Row | Config |
-|---|---|
-| 1 | BF16 baseline |
-| 2 | INT8 experts only |
-| 3 | INT8 experts + attention |
-| 4 | INT4 experts only |
-| 5 | INT4 experts + attention |
-
-Metrics: GPU memory, prefill/generation latency, throughput, router overlap, task accuracy.
+| `test_symmetric.py` | quantization math, error budget, per-tensor fallback |
+| `test_int4.py` | packing roundtrip, sign extension, nibble order, group and expert alignment, half-of-INT8 storage, adapter integration |
+| `test_scale_search.py` | MSE search beats amax on its own objective, INT4 gains and INT8 does not, storage layout and dequantize formula unchanged, config wiring and checkpoint roundtrip |
+| `test_memory.py` | resident-memory regression guards for the v0.1 bug |
+| `test_targeting.py` | structural detection, component globs, loud failures, audit trail |
+| `test_checkpoint_format.py` | no BF16 duplicates, bit-exact roundtrip, group-size recovery, manifest |
+| `test_quantlinear.py` | `QuantLinear` vs `nn.Linear` |
+| `test_llada_moe_adapter.py` | both modes, per-access dequantization, restore |
+| `test_api.py` | result surface, modes, non-destructive variants |
+| `test_validation.py` | tensor metrics, component comparison |
+| `test_trajectory.py` | states, masked-token and routing metrics, Mode A/B capture |
+| `test_trace_replay.py` | trace IO, compactness, offline replay, precision labels, noise floor |
+| `test_moe_regime.py` | roofline math, crossovers, routing statistics |
+| `test_llada_binding.py` | delegation to the production decoder, drift detection |
+| `test_router_capture.py` | router recomputation is bit-identical to the block's own, per-model isolation, hook lifecycle, top-k resolution |
 
 ---
 
 ## Roadmap
 
-1. **v0.1** (current): INT8 reference implementation, `QuantLinear`, LLaDA
-   expert adapter, metadata, tests.
-2. **v0.2**: full model-side integration in the inference project (editable
-   install), BF16-fallback toggle, attention projection quantization, and a
-   measured trajectory report on the real LLaDA-MoE checkpoint. If INT8 router
-   overlap turns out flat across the schedule, that is the finding — it points
-   the work at INT4 rather than at more diffusion-specific machinery.
-3. **v0.3**: Triton INT8 (W8A16) fused-MoE kernel consuming the packed buffers
-   directly, with benchmarks vs BF16.
-4. **v0.4**: groupwise INT4 + packing, activation calibration, outlier handling.
-5. **v1.0**: reproducible evaluation suite, documentation, frozen checkpoint
-   format.
+1. **v0.2 (current)** — packed INT8/INT4, honest memory modes, self-contained
+   checkpoints, safe targeting, split benchmarks, trajectory trace/replay,
+   MoE regime analysis.
+2. **v0.3** — measured trajectory + noise floor on the real LLaDA-MoE
+   checkpoint; real `topk_ids` routing statistics to replace the ideal-balance
+   assumption. This is also what decides whether INT4 is usable at all: scale
+   search narrows the gap, sensitivity-driven mixed precision (INT4 where a
+   layer tolerates it, INT8 where it does not) is the likely next step, and a
+   data-aware method (GPTQ/AWQ) is the fallback if neither suffices.
+3. **v0.4** — *conditional on v0.3 evidence*: a fused Triton MoE kernel
+   consuming packed weights. Build the W8A16/W4A16 path only if the target is
+   small-batch latency; the large-batch regime needs a capacity-to-throughput
+   measurement instead.
+4. **v1.0** — reproducible end-to-end evaluation, frozen checkpoint format.
+
+---
+
+## Changes from v0.1
+
+Four defects were found by measurement and fixed structurally.
+
+| Was | Now |
+|---|---|
+| Expert quantization kept BF16 `w1`/`w2` resident beside the packed buffers: **1.52x memory**, zero speedup, plus error | Two explicit modes; `PACKED` deletes the Parameters and measures **0.516x** (INT8) / **0.266x** (INT4) |
+| `bits=4` called `quantize_tensor` but never `pack_int4` — identical byte count to INT8 | INT4 is packed two per byte end to end, with alignment validation and tests |
+| Checkpoints stored BF16 *and* packed copies, though load recomputed the BF16 | Re-derivable tensors are dropped at save; absence is expected at load |
+| Targeting was `"expert" in name or "mlp" in name` plus "3-D w1/w2 with an even second dim" | Structural four-relation match, explicit `linear_include`, component globs, `TargetingError` |
+| `bench_experts.py` timed two identical BF16 matmuls and called the difference an INT8 result | Deleted; replaced by labelled storage / numerical / decision benchmarks |
+
+Breaking API changes: `quantize_model` returns `QuantizationResult` instead of
+`list[str]`; `config.matches()` is replaced by `matches_linear()` and
+structural expert detection; `validation.diffusion` / `validation.trajectory`
+moved to the `trajectory` package; `WEIGHTS_FILENAME` became
+`weights_filename(bits)`.
 
 ---
 
 ## Legal
 
-This repository contains no code from the LLaDA inference engine's
-`dInfer` directory. Verify the source model's license before publishing any
-derived quantized weights.
+This repository contains no code from the LLaDA inference engine's `dInfer`
+directory. `trajectory/llada.py` imports the inference repo's decoder at
+runtime when you point it there; it neither vendors nor modifies it. Verify
+the source model's license before publishing derived quantized weights.

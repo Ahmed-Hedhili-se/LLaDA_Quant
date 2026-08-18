@@ -1,15 +1,10 @@
-"""Validation: component-level comparison and diffusion-trajectory divergence."""
+"""Tensor- and component-level comparison.
+
+Trajectory-level validation moved to :mod:`LLaDA_Quant.trajectory`, which
+separates capture from metrics so results can be replayed offline.
+"""
 
 from .compare import ComponentReport, compare_models
-from .diffusion import (
-    AdvanceFn,
-    DiffusionState,
-    LogitsFn,
-    RouterFn,
-    fully_masked_state,
-    make_masked_states,
-    mask_positions_from_ids,
-)
 from .metrics import (
     cosine_similarity,
     kl_divergence,
@@ -23,31 +18,10 @@ from .metrics import (
     top2_margin,
     unmask_selection_agreement,
 )
-from .trajectory import (
-    FreeRunReport,
-    FreeRunStep,
-    StateReport,
-    TrajectoryReport,
-    compare_free_running,
-    compare_trajectory,
-)
 
 __all__ = [
     "ComponentReport",
     "compare_models",
-    "DiffusionState",
-    "LogitsFn",
-    "RouterFn",
-    "AdvanceFn",
-    "make_masked_states",
-    "fully_masked_state",
-    "mask_positions_from_ids",
-    "StateReport",
-    "TrajectoryReport",
-    "FreeRunStep",
-    "FreeRunReport",
-    "compare_trajectory",
-    "compare_free_running",
     "max_abs_error",
     "mean_abs_error",
     "max_rel_error",

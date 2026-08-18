@@ -49,13 +49,20 @@ def test_per_tensor_fallback_when_not_divisible():
 
 
 def test_int4_roundtrip_and_packing():
+    """Updated for v0.2: ``quantize_tensor(bits=4)`` now returns *packed*
+    storage, so ``q.q`` holds two nibbles per byte and its last dim is half
+    the logical one. The old assertion checked ``q.q`` for the [-8, 7] range
+    directly, which only held while INT4 was one value per byte — i.e. while
+    ``bits=4`` saved nothing."""
     torch.manual_seed(3)
     w = torch.randn(2, 16, 64)
     q = quantize_tensor(w, bits=4, group_size=16)
-    assert torch.all(q.q >= -8) and torch.all(q.q <= 7)
-    packed = pack_int4(q.q)
-    assert packed.shape[-1] == q.q.shape[-1] // 2
-    assert torch.equal(unpack_int4(packed), q.q)
+    assert q.packed
+    assert q.q.shape[-1] == w.shape[-1] // 2
+    unpacked = unpack_int4(q.q)
+    assert unpacked.shape == w.shape
+    assert torch.all(unpacked >= -8) and torch.all(unpacked <= 7)
+    assert torch.equal(pack_int4(unpacked), q.q)
     w_hat = q.dequantize()
     assert (w - w_hat).abs().max() / w.abs().max() < 1 / 7 * 1.1
 

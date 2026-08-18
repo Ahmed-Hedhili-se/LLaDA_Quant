@@ -1,83 +1,108 @@
-import copy
+"""Public API surface: results, modes, and non-destructive variants."""
 
+from __future__ import annotations
+
+import pytest
 import torch
+import torch.nn as nn
 
-from LLaDA_Quant.api import quantize_model, quantized_model
-from LLaDA_Quant.config import QuantConfig, matches
+from LLaDA_Quant import (
+    ExecutionMode,
+    QuantConfig,
+    quantize_and_measure,
+    quantize_model,
+    quantized_model,
+)
 from LLaDA_Quant.runtime.linear import QuantLinear
+from LLaDA_Quant.runtime.moe import is_packed_expert_block
 
 
-def test_matches_respects_excludes():
-    cfg = QuantConfig(bits=8, targets=("linear",), exclude=("router", "norm"))
-    assert matches("layers.0.self_attn.q_proj", cfg)
-    assert not matches("layers.0.mlp.gate", cfg)
-    assert not matches("layers.0.mlp.gate_proj", cfg)
-    assert not matches("model.norm", cfg)
-
-
-def test_quantize_model_linear_targets():
-    torch.manual_seed(0)
-    model = torch.nn.Sequential(
-        torch.nn.Linear(64, 32, bias=False),
-        torch.nn.Linear(32, 16, bias=False),
+def test_quantize_model_returns_an_audit_trail(moe_model):
+    result = quantize_model(moe_model, QuantConfig(group_size=64, targets=("expert",)))
+    assert result.names == ["layers.0.mlp", "layers.1.mlp"]
+    assert len(result.expert_blocks) == 2 and result.linears == []
+    assert result.quantized_bytes < result.source_bytes
+    assert result.weight_ratio == pytest.approx(
+        result.quantized_bytes / result.source_bytes
     )
-    cfg = QuantConfig(bits=8, group_size=16, targets=("linear",))
-    quantized = quantize_model(model, cfg)
-    assert len(quantized) == 2
-    assert isinstance(model[0], QuantLinear) and isinstance(model[1], QuantLinear)
 
+
+def test_summary_states_the_mode_honestly(moe_model):
+    import copy
+
+    packed = quantize_model(copy.deepcopy(moe_model), QuantConfig(group_size=64))
+    assert "PACKED mode" in packed.summary()
+    assert "Resident memory drops" in packed.summary()
+
+    reference = quantize_model(
+        copy.deepcopy(moe_model), QuantConfig(group_size=64, execution_mode="reference")
+    )
+    assert "LARGER than unquantized" in reference.summary()
+    assert "Validation only" in reference.summary()
+
+
+def test_quantized_model_leaves_the_original_untouched(moe_model):
+    clone = quantized_model(moe_model, QuantConfig(group_size=64, targets=("expert",)))
+    assert is_packed_expert_block(clone.layers[0].mlp)
+    assert not is_packed_expert_block(moe_model.layers[0].mlp)
+    assert isinstance(moe_model.layers[0].mlp.w1, nn.Parameter)
+
+
+def test_quantize_and_measure_returns_a_measured_comparison(moe_model):
+    clone, result, comparison = quantize_and_measure(
+        moe_model, QuantConfig(group_size=64, targets=("expert",))
+    )
+    assert comparison.baseline.total > comparison.quantized.total
+    assert comparison.ratio < 1.0
+    assert "0." in comparison.describe()
+    assert len(result.targets) == 2
+    assert not is_packed_expert_block(moe_model.layers[0].mlp), "original must be untouched"
+
+
+def test_linear_quantization_preserves_call_semantics():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(64, 32, bias=False), nn.Linear(32, 16, bias=False))
+    config = QuantConfig(bits=8, group_size=16, targets=("linear",), linear_include=("0", "1"))
+    result = quantize_model(model, config)
+
+    assert len(result.linears) == 2
+    assert isinstance(model[0], QuantLinear) and isinstance(model[1], QuantLinear)
     x = torch.randn(3, 64, dtype=torch.bfloat16)
     with torch.no_grad():
         out = model(x)
-    assert out.shape == (3, 16)
-    assert out.dtype == torch.bfloat16
+    assert out.shape == (3, 16) and out.dtype == torch.bfloat16
 
 
-def test_quantize_model_linear_excludes():
+def test_quantlinear_output_tracks_the_float_reference():
     torch.manual_seed(0)
-    model = torch.nn.Sequential(
-        torch.nn.Linear(64, 32),
-        torch.nn.Linear(32, 16),
+    model = nn.Sequential(nn.Linear(64, 32))
+    clone = quantized_model(
+        model, QuantConfig(bits=8, group_size=16, targets=("linear",), linear_include=("0",))
     )
-    cfg = QuantConfig(bits=8, group_size=16, targets=("linear",), exclude=("1",))
-    quantized = quantize_model(model, cfg)
-    assert quantized == ["0"]
-    assert isinstance(model[0], QuantLinear)
-    assert isinstance(model[1], torch.nn.Linear)
-
-
-def test_quantized_model_preserves_original():
-    torch.manual_seed(0)
-    model = torch.nn.Sequential(torch.nn.Linear(64, 32))
-    cfg = QuantConfig(bits=8, group_size=16, targets=("linear",))
-    clone = quantized_model(model, cfg)
-    assert isinstance(clone[0], QuantLinear)
-    assert isinstance(model[0], torch.nn.Linear)
-
     x = torch.randn(2, 64, dtype=torch.bfloat16)
     with torch.no_grad():
-        ref = model[0](x.to(torch.float32)).to(torch.bfloat16)
+        reference = model[0](x.to(torch.float32)).to(torch.bfloat16)
         out = clone(x)
-    assert (out.float() - ref.float()).abs().mean() < 1e-2
+    assert (out.float() - reference.float()).abs().mean() < 1e-2
 
 
-def test_quantize_model_moe_like_container():
-    torch.manual_seed(0)
-    container = torch.nn.Module()
-    container.layers = torch.nn.ModuleList(
-        [copy.deepcopy(make_block(i)) for i in range(3)]
+def test_expert_and_linear_targets_compose(moe_model):
+    config = QuantConfig(
+        bits=8,
+        group_size=64,
+        targets=("expert", "linear"),
+        linear_include=("q_proj",),
+        expect_expert_blocks=2,
+        expect_linears=2,
     )
-    cfg = QuantConfig(bits=8, group_size=32, targets=("expert",))
-    names = quantize_model(container, cfg)
-    assert len(names) == 3
-    for layer in container.layers:
-        assert hasattr(layer, "_qw1") and hasattr(layer, "_qw2")
-        assert layer.w1.dtype == torch.bfloat16
+    result = quantize_model(moe_model, config)
+    assert len(result.expert_blocks) == 2
+    assert len(result.linears) == 2
+    assert is_packed_expert_block(moe_model.layers[0].mlp)
+    assert isinstance(moe_model.layers[0].q_proj, QuantLinear)
 
 
-def make_block(i):
-    torch.manual_seed(i)
-    block = torch.nn.Module()
-    block.w1 = torch.nn.Parameter((torch.randn(4, 256, 64) * 0.01).to(torch.bfloat16))
-    block.w2 = torch.nn.Parameter((torch.randn(4, 64, 128) * 0.01).to(torch.bfloat16))
-    return block
+def test_execution_mode_enum_and_reduces_memory_flag():
+    assert QuantConfig().mode is ExecutionMode.PACKED
+    assert QuantConfig().reduces_memory
+    assert not QuantConfig(execution_mode="reference").reduces_memory

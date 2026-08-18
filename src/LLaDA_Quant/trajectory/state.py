@@ -137,7 +137,8 @@ def make_masked_states(
     same distribution a model conditions on mid-decode, where earlier tokens
     are its own (possibly wrong) predictions. For sensitivity screening this
     is fine; for a headline number, pass a real BF16 decode as
-    ``completion_ids`` or use :func:`~LLaDA_Quant.validation.trajectory.compare_free_running`.
+    ``completion_ids`` or use Mode B
+    (:func:`~LLaDA_Quant.trajectory.capture.capture_free_running`).
     """
     if prompt_ids.dim() == 1:
         prompt_ids = prompt_ids.unsqueeze(0)

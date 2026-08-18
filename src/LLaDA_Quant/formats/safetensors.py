@@ -3,56 +3,106 @@
 Layout on disk::
 
     <dir>/
-        model-int8.safetensors      packed ints + scales (+ materialized params)
-        quantization.json           QuantizationManifest (provenance + config)
+        model-int8.safetensors      packed ints + scales + untargeted tensors
+        quantization.json           manifest: config, targeting audit, totals
         source-checkpoint.json      pointer/hash of the unquantized source
 
-Buffers whose name starts with ``_q`` are the packed integer weights and
-``_s`` are scales; the original parameter tensors are stored too so the
-checkpoint can be loaded into a plain model or an already-quantized one.
+**No redundant BF16.** A quantized checkpoint never stores the dequantized
+expert weights, because the load path reconstructs them from the packed
+buffers anyway; storing both made the artifact larger than the unquantized
+model it came from. Tensors that are re-derivable are dropped at save time
+and their absence at load time is expected, not an error.
 """
 
 from __future__ import annotations
 
+import glob
 import os
-from typing import Optional
+from typing import List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file, save_file
 
-from .manifest import MANIFEST_FILENAME, SOURCE_FILENAME, QuantizationManifest, write_source_checkpoint_meta
+from ..config import QuantConfig
+from .manifest import (
+    MANIFEST_FILENAME,
+    SOURCE_FILENAME,
+    QuantizationManifest,
+    write_source_checkpoint_meta,
+)
 
-WEIGHTS_FILENAME = "model-int8.safetensors"
+WEIGHTS_GLOB = "model-int*.safetensors"
 
 
-def collect_quantized_state(model: nn.Module) -> dict[str, torch.Tensor]:
-    """State dict containing packed buffers and live params of quantized modules."""
-    state: dict[str, torch.Tensor] = {}
-    for name, tensor in model.state_dict().items():
-        if isinstance(tensor, torch.Tensor):
-            state[name] = tensor.cpu().detach()
-    return state
+def weights_filename(bits: int) -> str:
+    return f"model-int{bits}.safetensors"
+
+
+def derivable_tensor_names(manifest: QuantizationManifest) -> Set[str]:
+    """Tensors reconstructable from the packed buffers, so never stored.
+
+    For a fused expert block these are the BF16 ``w1``/``w2`` — present only
+    in REFERENCE mode, absent already in PACKED mode, and redundant in both.
+    """
+    names: Set[str] = set()
+    for target in manifest.targets:
+        if target.kind == "expert":
+            prefix = f"{target.name}." if target.name else ""
+            names.update({f"{prefix}w1", f"{prefix}w2"})
+    return names
+
+
+def collect_quantized_state(
+    model: nn.Module, manifest: Optional[QuantizationManifest] = None
+) -> dict[str, torch.Tensor]:
+    """State dict for the artifact, with re-derivable BF16 copies removed."""
+    skip = derivable_tensor_names(manifest) if manifest is not None else set()
+    return {
+        name: tensor.cpu().detach()
+        for name, tensor in model.state_dict().items()
+        if isinstance(tensor, torch.Tensor) and name not in skip
+    }
 
 
 def save_quantized_checkpoint(
     model: nn.Module,
     manifest: QuantizationManifest,
     directory: str,
-    weights_filename: str = WEIGHTS_FILENAME,
-) -> None:
-    """Write the full quantized artifact (tensors + manifests)."""
+    weights_file: Optional[str] = None,
+) -> str:
+    """Write the full quantized artifact. Returns the weights file path."""
     os.makedirs(directory, exist_ok=True)
-    state = collect_quantized_state(model)
-    save_file(state, os.path.join(directory, weights_filename))
+    bits = manifest.config.bits if manifest.config else 8
+    path = os.path.join(directory, weights_file or weights_filename(bits))
+    save_file(collect_quantized_state(model, manifest), path)
     manifest.save(directory)
     write_source_checkpoint_meta(directory, manifest.source_checkpoint)
+    return path
 
 
-def load_quantized_checkpoint(directory: str) -> tuple[dict[str, torch.Tensor], QuantizationManifest]:
+def find_weights_file(directory: str) -> str:
+    matches = sorted(glob.glob(os.path.join(directory, WEIGHTS_GLOB)))
+    if not matches:
+        raise FileNotFoundError(f"no {WEIGHTS_GLOB} in {directory!r}")
+    if len(matches) > 1:
+        raise RuntimeError(f"ambiguous checkpoint, multiple weight files: {matches}")
+    return matches[0]
+
+
+def checkpoint_size_bytes(directory: str) -> int:
+    """Total on-disk size of the artifact (weights + manifests)."""
+    return sum(
+        os.path.getsize(os.path.join(directory, f))
+        for f in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, f))
+    )
+
+
+def load_quantized_checkpoint(directory: str) -> Tuple[dict[str, torch.Tensor], QuantizationManifest]:
     """Load packed tensors + manifest. Does not mutate any model."""
     manifest = QuantizationManifest.from_dict(_read_json(directory, MANIFEST_FILENAME))
-    state = load_file(os.path.join(directory, WEIGHTS_FILENAME), device="cpu")
+    state = load_file(find_weights_file(directory), device="cpu")
     return state, manifest
 
 
@@ -63,22 +113,27 @@ def _read_json(directory: str, filename: str) -> dict:
         return json.load(f)
 
 
-def _register_missing_buffers(model: nn.Module, state: dict[str, torch.Tensor]) -> list[str]:
+def _register_missing_buffers(model: nn.Module, state: dict[str, torch.Tensor]) -> List[str]:
     """Add persistent buffers found in ``state`` but absent from ``model``.
 
     Needed so a plain (unquantized) model can absorb a quantized checkpoint
     that adds packed expert buffers (``_qw1``, ``_sw1``, ...).
     """
     existing = set(model.state_dict().keys())
-    registered: list[str] = []
+    registered: List[str] = []
     for name, tensor in state.items():
         if name in existing:
             continue
-        module = model
-        parts = name.split(".")
-        for part in parts[:-1]:
-            module = module.get_submodule(part)
-        module.register_buffer(parts[-1], tensor.clone(), persistent=True)
+        parent_path, _, leaf = name.rpartition(".")
+        try:
+            module = model.get_submodule(parent_path) if parent_path else model
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"state dict mismatch: checkpoint holds {name!r} but the model has no "
+                f"submodule {parent_path!r} ({exc}). The checkpoint was produced from a "
+                "different architecture."
+            ) from exc
+        module.register_buffer(leaf, tensor.clone(), persistent=True)
         registered.append(name)
     return registered
 
@@ -88,20 +143,25 @@ def load_quantized_weights(
     directory: str,
     strict: bool = True,
 ) -> QuantizationManifest:
-    """Load a quantized checkpoint into ``model`` (may be the plain model).
+    """Load a quantized checkpoint into ``model`` (plain or already quantized).
 
-    Missing quantized buffers (packed expert weights/scales) are registered
-    on the fly; after loading, LLaDA expert blocks re-materialize their live
-    ``w1``/``w2`` Parameters from the packed buffers, so the model is
-    immediately runnable.
+    Missing packed buffers are registered on the fly. The BF16 expert weights
+    are *expected* to be absent from the checkpoint; they are re-derived after
+    loading, so their absence never counts as a missing key. Any other missing
+    or unexpected key is a real mismatch and raises when ``strict``.
     """
     state, manifest = load_quantized_checkpoint(directory)
+    config: Optional[QuantConfig] = manifest.config
     _register_missing_buffers(model, state)
-    missing, unexpected = model.load_state_dict(state, strict=strict)
-    if (missing or unexpected) and strict:
-        raise RuntimeError(f"state dict mismatch: missing={missing}, unexpected={unexpected}")
-    if manifest.config is not None:
+
+    expected_missing = derivable_tensor_names(manifest)
+    incompatible, unexpected = model.load_state_dict(state, strict=False)
+    missing = [key for key in incompatible if key not in expected_missing]
+    if strict and (missing or unexpected):
+        raise RuntimeError(f"state dict mismatch: missing={missing}, unexpected={list(unexpected)}")
+
+    if config is not None:
         from ..adapters.llada_moe import restore_llada_experts_from_buffers
 
-        restore_llada_experts_from_buffers(model, manifest.config)
+        restore_llada_experts_from_buffers(model, config)
     return manifest

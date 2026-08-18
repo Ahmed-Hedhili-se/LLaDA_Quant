@@ -1,4 +1,10 @@
-"""Quantization manifest: provenance and per-tensor metadata for a checkpoint."""
+"""Quantization manifest: provenance, targeting audit trail, per-tensor metadata.
+
+The manifest is what makes a run reproducible *and* auditable. Beyond the
+config it records exactly which modules were converted, their shapes, and how
+many bytes each one cost before and after — so a memory claim can be checked
+against the artifact instead of taken on trust.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -26,11 +32,36 @@ def _sha256(path: str) -> str:
 
 
 @dataclass
+class TargetedModule:
+    """One module a quantization run actually converted.
+
+    ``source_bytes`` and ``quantized_bytes`` are measured, not estimated, and
+    are what :mod:`LLaDA_Quant.memory` cross-checks its accounting against.
+    """
+
+    name: str
+    kind: str
+    module_type: str
+    shapes: Dict[str, List[int]]
+    bits: int
+    group_size: int
+    packed: bool
+    execution_mode: str
+    source_bytes: int
+    quantized_bytes: int
+
+    @property
+    def compression_ratio(self) -> float:
+        """Quantized bytes divided by source bytes — lower is better."""
+        return self.quantized_bytes / self.source_bytes if self.source_bytes else 1.0
+
+
+@dataclass
 class QuantEntry:
     """Metadata for one quantized tensor."""
 
     tensor_name: str
-    shape: list[int]
+    shape: List[int]
     bits: int
     group_size: int
     storage_dtype: str
@@ -44,11 +75,20 @@ class QuantizationManifest:
     """Versioned, human-readable record of everything that produced a checkpoint."""
 
     format_version: int = FORMAT_VERSION
-    framework_version: str = "0.1.0"
+    framework_version: str = "0.2.0"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     source_checkpoint: Optional[str] = None
     config: Optional[QuantConfig] = None
-    entries: list[QuantEntry] = field(default_factory=list)
+    entries: List[QuantEntry] = field(default_factory=list)
+    targets: List[TargetedModule] = field(default_factory=list)
+
+    @property
+    def source_bytes(self) -> int:
+        return sum(t.source_bytes for t in self.targets)
+
+    @property
+    def quantized_bytes(self) -> int:
+        return sum(t.quantized_bytes for t in self.targets)
 
     def to_dict(self) -> dict:
         return {
@@ -58,12 +98,19 @@ class QuantizationManifest:
             "source_checkpoint": self.source_checkpoint,
             "config": self.config.to_dict() if self.config else None,
             "entries": [asdict(e) for e in self.entries],
+            "targets": [asdict(t) for t in self.targets],
+            "totals": {
+                "source_bytes": self.source_bytes,
+                "quantized_bytes": self.quantized_bytes,
+                "module_count": len(self.targets),
+            },
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "QuantizationManifest":
         cfg = QuantConfig.from_dict(data["config"]) if data.get("config") else None
         entries = [QuantEntry(**e) for e in data.get("entries", [])]
+        targets = [TargetedModule(**t) for t in data.get("targets", [])]
         return cls(
             format_version=data.get("format_version", FORMAT_VERSION),
             framework_version=data.get("framework_version", "unknown"),
@@ -71,6 +118,7 @@ class QuantizationManifest:
             source_checkpoint=data.get("source_checkpoint"),
             config=cfg,
             entries=entries,
+            targets=targets,
         )
 
     def to_json(self) -> str:

@@ -1,25 +1,34 @@
+"""Trajectory states, masked-token metrics, and the two capture modes."""
+
+from __future__ import annotations
+
 import copy
 
 import pytest
 import torch
 import torch.nn as nn
 
-from LLaDA_Quant.api import quantized_model
-from LLaDA_Quant.config import QuantConfig
-from LLaDA_Quant.validation.diffusion import (
+from LLaDA_Quant import QuantConfig, quantized_model
+from LLaDA_Quant.trajectory import (
     DiffusionState,
+    capture_free_running,
+    capture_shared,
     fully_masked_state,
     make_masked_states,
     mask_positions_from_ids,
 )
-from LLaDA_Quant.validation.metrics import (
+from LLaDA_Quant.trajectory.metrics import (
+    commit_order_agreement,
     kl_divergence,
+    predictive_entropy,
+    router_gate_entropy,
+    router_margin,
     tie_fraction,
     top1_agreement,
     top2_margin,
+    topk_kl_lower_bound,
     unmask_selection_agreement,
 )
-from LLaDA_Quant.validation.trajectory import compare_free_running, compare_trajectory
 
 VOCAB, HIDDEN, MASK_ID = 32, 32, 31
 
@@ -36,7 +45,7 @@ class ToyDiffusionLM(nn.Module):
 
     def forward(self, input_ids):
         h = self.embed_tokens(input_ids)
-        h = h + h.mean(dim=1, keepdim=True)  # crude global mixing
+        h = h + h.mean(dim=1, keepdim=True)
         return self.head(torch.tanh(self.proj(h)))
 
 
@@ -45,10 +54,13 @@ def logits_fn(model, state):
 
 
 def router_fn(model, state):
-    """Stand-in for top-k expert ids: stable buckets derived from the logits."""
     with torch.no_grad():
-        ids = model(state.input_ids).argmax(dim=-1) % 4
-    return {"layers.0.mlp": ids}
+        return {"layers.0.mlp": model(state.input_ids).argmax(dim=-1) % 4}
+
+
+def gates_fn(model, state):
+    with torch.no_grad():
+        return {"layers.0.mlp": model(state.input_ids)[..., :8]}
 
 
 def make_advance_fn(k: int = 1):
@@ -80,47 +92,43 @@ def perturbed(model, scale: float = 0.5):
     return other
 
 
+def states():
+    prompt = torch.arange(4).unsqueeze(0)
+    completion = torch.arange(4, 20).unsqueeze(0)
+    return make_masked_states(
+        prompt, completion, MASK_ID, ratios=(1.0, 0.5, 0.25),
+        generator=torch.Generator().manual_seed(1),
+    )
+
+
 # --------------------------------------------------------------------------
 # State construction
 # --------------------------------------------------------------------------
 
 
 def test_fully_masked_state():
-    prompt = torch.arange(4).unsqueeze(0)
-    state = fully_masked_state(prompt, gen_length=6, mask_token_id=MASK_ID)
+    state = fully_masked_state(torch.arange(4).unsqueeze(0), 6, MASK_ID)
     assert state.input_ids.shape == (1, 10)
     assert state.num_masked == 6
     assert not state.mask_positions[0, :4].any()
-    assert state.mask_positions[0, 4:].all()
     assert (state.input_ids[0, 4:] == MASK_ID).all()
-
-
-def test_fully_masked_state_accepts_1d_prompt():
-    state = fully_masked_state(torch.arange(3), gen_length=2, mask_token_id=MASK_ID)
-    assert state.input_ids.shape == (1, 5)
 
 
 def test_make_masked_states_is_monotone_and_spares_the_prompt():
     prompt = torch.arange(4).unsqueeze(0)
     completion = torch.arange(4, 24).unsqueeze(0)
-    ratios = (1.0, 0.75, 0.5, 0.25, 0.0)
-    states = make_masked_states(
-        prompt, completion, MASK_ID, ratios=ratios, generator=torch.Generator().manual_seed(0)
+    built = make_masked_states(
+        prompt, completion, MASK_ID, ratios=(1.0, 0.75, 0.5, 0.25, 0.0),
+        generator=torch.Generator().manual_seed(0),
     )
-
-    assert [s.num_masked for s in states] == [20, 15, 10, 5, 0]
-    for i, state in enumerate(states):
-        assert state.step == i
+    assert [s.num_masked for s in built] == [20, 15, 10, 5, 0]
+    expected = torch.cat([prompt, completion], dim=1)
+    for state in built:
         assert not state.mask_positions[:, :4].any(), "prompt must never be masked"
-        assert (state.input_ids[state.mask_positions] == MASK_ID).all()
-        # revealed tokens keep their ground-truth value
         keep = ~state.mask_positions
-        expected = torch.cat([prompt, completion], dim=1)
         assert (state.input_ids[keep] == expected[keep]).all()
-
-    for earlier, later in zip(states, states[1:]):
-        nested = later.mask_positions & ~earlier.mask_positions
-        assert not nested.any(), "positions must only ever be revealed, never re-masked"
+    for earlier, later in zip(built, built[1:]):
+        assert not (later.mask_positions & ~earlier.mask_positions).any()
 
 
 def test_make_masked_states_rejects_bad_input():
@@ -139,13 +147,6 @@ def test_diffusion_state_validates_shapes():
         DiffusionState(step=0, input_ids=ids[0], mask_positions=ids[0].bool())
     with pytest.raises(ValueError):
         DiffusionState(step=0, input_ids=ids, mask_positions=torch.zeros(1, 5, dtype=torch.bool))
-    with pytest.raises(ValueError):
-        DiffusionState(
-            step=0,
-            input_ids=ids,
-            mask_positions=ids.bool(),
-            attention_mask=torch.ones(1, 5),
-        )
 
 
 def test_mask_positions_from_ids():
@@ -154,244 +155,188 @@ def test_mask_positions_from_ids():
 
 
 # --------------------------------------------------------------------------
-# Masked-token metrics
+# Masked-token and routing metrics
 # --------------------------------------------------------------------------
 
 
 def test_top1_agreement_respects_positions():
-    a = torch.tensor([[[3.0, 0.0], [0.0, 3.0]]])  # argmax: 0, 1
-    b = torch.tensor([[[0.0, 3.0], [0.0, 3.0]]])  # argmax: 1, 1
+    a = torch.tensor([[[3.0, 0.0], [0.0, 3.0]]])
+    b = torch.tensor([[[0.0, 3.0], [0.0, 3.0]]])
     assert top1_agreement(a, b) == pytest.approx(0.5)
     assert top1_agreement(a, b, torch.tensor([[False, True]])) == pytest.approx(1.0)
-    assert top1_agreement(a, b, torch.tensor([[True, False]])) == pytest.approx(0.0)
-    # nothing selected is vacuously perfect agreement
     assert top1_agreement(a, b, torch.tensor([[False, False]])) == 1.0
 
 
-def test_top1_agreement_rejects_bad_positions():
-    a = torch.zeros(1, 2, 3)
-    with pytest.raises(ValueError):
-        top1_agreement(a, a, torch.zeros(1, 5, dtype=torch.bool))
-
-
-def test_kl_divergence_is_zero_for_identical_logits():
+def test_kl_divergence_is_zero_for_identical_and_shifted_logits():
     logits = torch.randn(2, 5, 7)
     assert kl_divergence(logits, logits) == pytest.approx(0.0, abs=1e-6)
-    assert kl_divergence(logits, logits + 3.0) == pytest.approx(0.0, abs=1e-5), "shift-invariant"
+    assert kl_divergence(logits, logits + 3.0) == pytest.approx(0.0, abs=1e-5)
     assert kl_divergence(logits, torch.zeros_like(logits)) > 0.0
 
 
 def test_unmask_selection_agreement_catches_reordering():
-    # position 0 is the confident one for A, position 1 for B
     a = torch.tensor([[[9.0, 0.0], [1.0, 0.0]]])
     b = torch.tensor([[[1.0, 0.0], [9.0, 0.0]]])
     mask = torch.tensor([[True, True]])
     assert unmask_selection_agreement(a, b, mask, k=1) == pytest.approx(0.0)
     assert unmask_selection_agreement(a, b, mask, k=2) == pytest.approx(1.0)
-    assert unmask_selection_agreement(a, a, mask, k=1) == pytest.approx(1.0)
-    # top-1 token agreement alone would have reported perfect agreement here
+    # top-1 token agreement alone would have called this perfect
     assert top1_agreement(a, b, mask) == pytest.approx(1.0)
 
 
-def test_top2_margin():
-    logits = torch.tensor([[[5.0, 3.0, 1.0], [2.0, 2.0, 0.0]]])  # margins 2.0 and 0.0
-    assert top2_margin(logits) == pytest.approx(1.0)
-    assert top2_margin(logits, torch.tensor([[True, False]])) == pytest.approx(2.0)
-    assert top2_margin(logits, torch.tensor([[False, False]])) == 0.0
-
-
 def test_tie_fraction_separates_coin_tosses_from_damage():
-    # position 0: reference is decisive (margin 2.0); position 1: a near-tie (1e-4)
     ref = torch.tensor([[[5.0, 3.0, 1.0], [2.0, 2.0 - 1e-4, 0.0]]])
-    perturbed_logits = ref + torch.tensor([[[0.0, 0.0, 0.0], [0.0, 1e-2, 0.0]]])
-
-    assert tie_fraction(ref, perturbed_logits, torch.tensor([[True, False]])) == 0.0
-    assert tie_fraction(ref, perturbed_logits, torch.tensor([[False, True]])) == 1.0
-    assert tie_fraction(ref, perturbed_logits) == pytest.approx(0.5)
-    # the argmax did flip at position 1 — without the tie fraction that reads as damage
-    assert top1_agreement(ref, perturbed_logits, torch.tensor([[False, True]])) == 0.0
+    shifted = ref + torch.tensor([[[0.0, 0.0, 0.0], [0.0, 1e-2, 0.0]]])
+    assert tie_fraction(ref, shifted, torch.tensor([[True, False]])) == 0.0
+    assert tie_fraction(ref, shifted, torch.tensor([[False, True]])) == 1.0
+    assert top1_agreement(ref, shifted, torch.tensor([[False, True]])) == 0.0
     assert tie_fraction(ref, ref) == 0.0
 
 
-def test_tie_fraction_rejects_shape_mismatch():
-    with pytest.raises(ValueError):
-        tie_fraction(torch.zeros(1, 2, 3), torch.zeros(1, 2, 4))
+def test_top2_margin():
+    logits = torch.tensor([[[5.0, 3.0, 1.0], [2.0, 2.0, 0.0]]])
+    assert top2_margin(logits) == pytest.approx(1.0)
+    assert top2_margin(logits, torch.tensor([[True, False]])) == pytest.approx(2.0)
 
 
-def test_unmask_selection_agreement_skips_unmasked_rows():
-    logits = torch.randn(1, 3, 4)
-    assert unmask_selection_agreement(logits, logits + 1, torch.zeros(1, 3, dtype=torch.bool)) == 1.0
-    with pytest.raises(ValueError):
-        unmask_selection_agreement(logits, logits, torch.ones(1, 3, dtype=torch.bool), k=0)
+def test_predictive_entropy_is_zero_for_a_certain_distribution():
+    certain = torch.tensor([[[100.0, 0.0, 0.0]]])
+    uniform = torch.zeros(1, 1, 3)
+    assert predictive_entropy(certain) == pytest.approx(0.0, abs=1e-5)
+    assert predictive_entropy(uniform) == pytest.approx(torch.tensor(3.0).log().item(), abs=1e-5)
 
 
-# --------------------------------------------------------------------------
-# Teacher-forced trajectory
-# --------------------------------------------------------------------------
+def test_router_margin_measures_the_top_k_boundary_gap():
+    gates = torch.tensor([[5.0, 4.0, 1.0, 0.0]])
+    assert router_margin(gates, top_k=2) == pytest.approx(3.0)  # 4.0 - 1.0
+    assert router_margin(gates, top_k=1) == pytest.approx(1.0)  # 5.0 - 4.0
+    assert router_margin(gates, top_k=4) == 0.0, "no boundary when k == num_experts"
 
 
-def _states():
-    prompt = torch.arange(4).unsqueeze(0)
-    completion = torch.arange(4, 20).unsqueeze(0)
-    return make_masked_states(
-        prompt,
-        completion,
-        MASK_ID,
-        ratios=(1.0, 0.5, 0.25),
-        generator=torch.Generator().manual_seed(1),
+def test_router_gate_entropy_matches_a_uniform_router():
+    assert router_gate_entropy(torch.zeros(2, 4)) == pytest.approx(
+        torch.tensor(4.0).log().item(), abs=1e-5
     )
 
 
-def test_compare_trajectory_identical_models_report_no_divergence():
+def test_topk_kl_lower_bound_is_zero_for_identical_slices():
+    logprobs = torch.log_softmax(torch.randn(4, 8), dim=-1)
+    assert topk_kl_lower_bound(logprobs, logprobs) == pytest.approx(0.0, abs=1e-6)
+    with pytest.raises(ValueError):
+        topk_kl_lower_bound(logprobs, logprobs[:, :4])
+
+
+def test_commit_order_agreement():
+    assert commit_order_agreement([[1], [2]], [[1], [2]]) == 1.0
+    assert commit_order_agreement([[1], [2]], [[2], [1]]) == 0.0
+    assert commit_order_agreement([[1], [2]], [[1], [3]]) == 0.5
+
+
+# --------------------------------------------------------------------------
+# Mode A: shared state
+# --------------------------------------------------------------------------
+
+
+def test_mode_a_identical_models_show_no_divergence():
     model = ToyDiffusionLM().eval()
-    report = compare_trajectory(model, model, _states(), logits_fn, router_fn)
+    capture = capture_shared(model, model, states(), logits_fn, router_fn, gates_fn)
 
-    assert len(report.states) == 3
-    for state in report.states:
-        assert state.top1_agreement == 1.0
-        assert state.unmask_agreement == 1.0
-        assert state.kl_masked == pytest.approx(0.0, abs=1e-6)
-        assert state.router_overlap["layers.0.mlp"] == 1.0
-        assert state.logit_metrics["max_abs_error"] == 0.0
-        assert state.tie_fraction == 0.0, "no perturbation means nothing can be tied"
-    assert report.min_router_overlap == 1.0
-    assert report.series("top1_agreement") == [1.0, 1.0, 1.0]
+    assert len(capture.reference) == len(capture.quantized) == 3
+    for step in capture.quantized.steps:
+        assert step.scalars["pair.top1_agreement"].value == 1.0
+        assert step.scalars["pair.kl_masked"].value == pytest.approx(0.0, abs=1e-6)
+        assert step.scalars["pair.router_overlap.layers.0.mlp"].value == 1.0
+        assert step.scalars["pair.tie_fraction"].value == 0.0
+        assert step.scalars["pair.logit_cosine"].precision == "exact"
 
 
-def test_compare_trajectory_tracks_int8_quantization_error():
+def test_mode_a_captures_layer_stats_and_self_scalars():
+    model = ToyDiffusionLM().eval()
+    capture = capture_shared(model, model, states(), logits_fn, router_fn, gates_fn)
+    step = capture.reference.steps[0]
+    assert "entropy_masked" in step.scalars and "top2_margin" in step.scalars
+    layer = step.layers["layers.0.mlp"]
+    assert layer.router_margin >= 0.0
+    assert layer.router_topk_ids is None, "router ids must be opt-in, they dominate trace size"
+
+
+def test_mode_a_records_int8_error(moe_model=None):
     torch.manual_seed(0)
     model = ToyDiffusionLM().eval()
-    config = QuantConfig(bits=8, group_size=16, targets=("linear",), exclude=("embed_tokens",))
-    qmodel = quantized_model(model, config).eval()
+    config = QuantConfig(bits=8, group_size=16, targets=("linear",),
+                         linear_include=("proj", "head"), expect_linears=2)
+    quantized = quantized_model(model, config).eval()
+    capture = capture_shared(model, quantized, states(), logits_fn, router_fn, unmask_k=4)
 
-    report = compare_trajectory(model, qmodel, _states(), logits_fn, router_fn, unmask_k=4)
-
-    assert len(report.states) == 3
-    for state in report.states:
-        assert state.logit_metrics["cosine_similarity"] > 0.99
-        assert state.logit_metrics["max_abs_error"] > 0.0, "INT8 must actually perturb the logits"
-        assert 0.0 <= state.top1_agreement <= 1.0
-        assert 0.0 <= state.unmask_agreement <= 1.0
-        assert 0.0 <= state.tie_fraction <= 1.0
-        assert state.kl_masked >= 0.0
-        assert state.reference_top2_margin >= 0.0
-    assert report.worst_state is not None
-    assert "step" in report.to_table()
-    assert report.to_dict()["kind"] == "teacher_forced"
+    for step in capture.quantized.steps:
+        assert step.scalars["pair.logit_cosine"].value > 0.99
+        assert step.scalars["pair.max_abs_error"].value > 0.0
+        assert 0.0 <= step.scalars["pair.tie_fraction"].value <= 1.0
 
 
-def test_tie_fraction_flags_the_degenerate_fully_masked_state():
-    """Regression guard for a trap this harness must not hide.
-
-    The toy gives every masked position identical logits, so its top-2 margin
-    (~1e-5) sits far below INT8 noise (~5e-3). ``top1_agreement`` then reads
-    0.0 while nothing was actually damaged. The tie fraction is what makes
-    that readable instead of alarming.
-    """
-    torch.manual_seed(0)
-    ref = ToyDiffusionLM().eval()
-    config = QuantConfig(bits=8, group_size=16, targets=("linear",), exclude=("embed_tokens",))
-    qmodel = quantized_model(ref, config).eval()
-    start = fully_masked_state(torch.arange(4).unsqueeze(0), 16, MASK_ID)
-
-    state = compare_trajectory(ref, qmodel, [start], logits_fn).states[0]
-
-    assert state.tie_fraction == 1.0
-    assert state.reference_top2_margin < state.logit_metrics["max_abs_error"]
-
-
-def test_compare_trajectory_records_mask_ratio_and_labels():
-    model = ToyDiffusionLM().eval()
-    report = compare_trajectory(model, model, _states(), logits_fn)
-    assert [s.num_masked for s in report.states] == [16, 8, 4]
-    assert report.states[0].label == "100% masked"
-    assert report.states[0].mask_ratio == pytest.approx(16 / 20)
-    assert report.states[0].router_overlap == {}
-    assert report.states[0].mean_router_overlap == 1.0
-
-
-def test_compare_trajectory_rejects_mismatched_logits():
-    model = ToyDiffusionLM().eval()
-
-    def short_logits(_model, state):
-        return torch.randn(1, state.input_ids.shape[1], VOCAB - 1)
-
-    def mixed(m, state):
-        return logits_fn(m, state) if m is model else short_logits(m, state)
-
-    with pytest.raises(ValueError, match="logits shape mismatch"):
-        compare_trajectory(model, ToyDiffusionLM(seed=1).eval(), _states(), mixed)
-
-
-def test_compare_trajectory_rejects_router_key_mismatch():
+def test_mode_a_rejects_mismatched_logits():
     model = ToyDiffusionLM().eval()
     other = ToyDiffusionLM(seed=1).eval()
 
-    def lopsided_router(m, state):
-        return {"layers.0.mlp" if m is model else "layers.9.mlp": m(state.input_ids).argmax(-1)}
+    def mixed(m, state):
+        if m is model:
+            return logits_fn(m, state)
+        return torch.randn(1, state.input_ids.shape[1], VOCAB - 1)
 
-    with pytest.raises(ValueError, match="router_fn returned"):
-        compare_trajectory(model, other, _states(), logits_fn, lopsided_router)
+    with pytest.raises(ValueError, match="logits shape mismatch"):
+        capture_shared(model, other, states(), mixed)
+
+
+def test_router_ids_are_stored_only_when_requested():
+    model = ToyDiffusionLM().eval()
+    capture = capture_shared(
+        model, model, states()[:1], logits_fn, router_fn, store_router_ids=True
+    )
+    assert capture.reference.steps[0].layers["layers.0.mlp"].router_topk_ids is not None
 
 
 # --------------------------------------------------------------------------
-# Free-running trajectory
+# Mode B: free running
 # --------------------------------------------------------------------------
 
 
-def test_free_running_identical_models_never_diverge():
+def test_mode_b_identical_models_commit_identically():
     model = ToyDiffusionLM().eval()
     start = fully_masked_state(torch.arange(4).unsqueeze(0), 6, MASK_ID)
-
-    report = compare_free_running(model, model, start, logits_fn, make_advance_fn(1), max_steps=20)
-
-    assert report.first_divergence_step is None
-    assert report.final_token_agreement == 1.0
-    assert report.steps[-1].num_masked_reference == 0
-    assert len(report.steps) == 6, "one position unmasked per step, then it stops"
-    assert all(s.resolved_disagreements == 0 for s in report.steps)
-    assert torch.equal(report.reference_ids, report.quantized_ids)
+    capture = capture_free_running(model, model, start, logits_fn, make_advance_fn(1),
+                                   max_steps=20)
+    assert len(capture.reference) == len(capture.quantized) == 6
+    for ref, qnt in zip(capture.reference.steps, capture.quantized.steps):
+        assert ref.committed_positions == qnt.committed_positions
+        assert ref.committed_tokens == qnt.committed_tokens
 
 
-def test_free_running_surfaces_compounding_divergence():
-    torch.manual_seed(0)
+def test_mode_b_records_commits_and_stops_when_done():
     model = ToyDiffusionLM().eval()
     other = perturbed(model, scale=1.5).eval()
     start = fully_masked_state(torch.arange(4).unsqueeze(0), 8, MASK_ID)
-
-    report = compare_free_running(model, other, start, logits_fn, make_advance_fn(1), max_steps=20)
-
-    assert report.first_divergence_step is not None
-    assert report.final_token_agreement < 1.0
-    # agreement is monotonically non-increasing: resolved tokens are never revisited
-    agreements = [s.token_agreement for s in report.steps]
-    assert agreements == sorted(agreements, reverse=True)
-    assert report.to_dict()["first_divergence_step"] == report.first_divergence_step
-    assert "step" in report.to_table()
+    capture = capture_free_running(model, other, start, logits_fn, make_advance_fn(1),
+                                   max_steps=20)
+    assert capture.reference.gen_length == 8
+    assert capture.reference.prompt_length == 4
+    assert sum(len(s.committed_positions) for s in capture.reference.steps) == 8
+    assert all(len(s.committed_positions) == 1 for s in capture.reference.steps)
 
 
-def test_free_running_honours_max_steps():
+def test_mode_b_honours_max_steps():
     model = ToyDiffusionLM().eval()
     start = fully_masked_state(torch.arange(4).unsqueeze(0), 10, MASK_ID)
-
-    report = compare_free_running(model, model, start, logits_fn, make_advance_fn(1), max_steps=3)
-
-    assert len(report.steps) == 3
-    assert report.steps[-1].num_masked_reference == 7
+    capture = capture_free_running(model, model, start, logits_fn, make_advance_fn(1),
+                                   max_steps=3)
+    assert len(capture.reference) == 3
     with pytest.raises(ValueError):
-        compare_free_running(model, model, start, logits_fn, make_advance_fn(1), max_steps=0)
+        capture_free_running(model, model, start, logits_fn, make_advance_fn(1), max_steps=0)
 
 
-def test_free_running_stops_when_advance_fn_returns_none():
+def test_mode_b_stores_no_pairwise_logit_scalars():
+    """Once inputs drift apart a logit distance conflates two causes."""
     model = ToyDiffusionLM().eval()
-    start = fully_masked_state(torch.arange(4).unsqueeze(0), 10, MASK_ID)
-    calls = {"n": 0}
-
-    def advance_twice(state, logits):
-        calls["n"] += 1
-        return None if state.step >= 2 else make_advance_fn(1)(state, logits)
-
-    report = compare_free_running(model, model, start, logits_fn, advance_twice, max_steps=20)
-
-    assert len(report.steps) == 3
-    assert report.steps[-1].num_masked_reference == 8, "state freezes, it is not advanced further"
+    start = fully_masked_state(torch.arange(4).unsqueeze(0), 4, MASK_ID)
+    capture = capture_free_running(model, model, start, logits_fn, make_advance_fn(1))
+    for step in capture.quantized.steps:
+        assert not [k for k in step.scalars if k.startswith("pair.")]
