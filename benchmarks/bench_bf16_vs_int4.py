@@ -78,8 +78,13 @@ from LLaDA_Quant.trajectory import (
 # --------------------------------------------------------------------------
 
 
-def build_bf16_model(repo: str, weight_dir: str, device: str):
-    """Build the fused-MoE BF16 model exactly the way the inference repo does."""
+def build_bf16_model(repo: str, weight_dir: str):
+    """Build the fused-MoE BF16 model on CPU, the way the inference repo does.
+
+    Deliberately stays on the host: both models have to be resident at once for
+    the comparison, and 2 x 12.88 GB of BF16 experts does not fit on a 24 GB
+    card. Quantize first, move second.
+    """
     if repo not in sys.path:
         sys.path.insert(0, repo)
     from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
@@ -94,12 +99,11 @@ def build_bf16_model(repo: str, weight_dir: str, device: str):
         fused = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
         fused.load_state_dict_from_unfused(layer.mlp)
         layer.mlp = fused
-    return model.to(device).eval()
+    return model.eval()
 
 
-def make_int4_model(bf16_model, group_size: int, search: str, device: str):
-    """Deep-copy the BF16 model and quantize its experts to packed INT4."""
-    config = QuantConfig(
+def int4_config(group_size: int, search: str) -> QuantConfig:
+    return QuantConfig(
         bits=4,
         group_size=group_size,
         targets=("expert",),
@@ -107,9 +111,44 @@ def make_int4_model(bf16_model, group_size: int, search: str, device: str):
         scale_search=search,
         expect_expert_blocks=LLADA_MOE_7B_A1B.num_layers,
     )
-    clone = copy.deepcopy(bf16_model)
-    result = quantize_model(clone, config)
-    return clone.to(device).eval(), result, config
+
+
+def build_model_pair(repo: str, weight_dir: str, args):
+    """BF16 and INT4 models, both on ``args.device``, without a 26 GB VRAM peak.
+
+    Order matters. Quantization happens on the host, so the INT4 copy is 3.22 GB
+    before either model is moved; the pair then needs ~16.1 GB of VRAM instead of
+    ~25.8 GB. On a 24 GB card the naive order (move, then deep-copy) OOMs.
+
+    ``--rebuild-for-int4`` loads the checkpoint a second time instead of
+    deep-copying, trading load time for ~13 GB less host RAM. Use it if the
+    server has less than ~32 GB of system memory.
+    """
+    config = int4_config(args.group_size, args.scale_search)
+
+    print("building BF16 model on CPU ...")
+    bf16 = build_bf16_model(repo, weight_dir)
+
+    if args.rebuild_for_int4:
+        print("rebuilding a second copy for INT4 (--rebuild-for-int4) ...")
+        int4 = build_bf16_model(repo, weight_dir)
+    else:
+        print("deep-copying for INT4 (host RAM peak ~26 GB) ...")
+        int4 = copy.deepcopy(bf16)
+
+    print(f"quantizing on CPU (group_size={args.group_size}, "
+          f"scale_search={args.scale_search}) ...")
+    result = quantize_model(int4, config)
+    memory = compare_resident_memory(bf16, int4, label="INT4 PACKED")
+
+    print(f"moving both models to {args.device} ...")
+    return (
+        bf16.to(args.device).eval(),
+        int4.to(args.device).eval(),
+        result,
+        config,
+        memory,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -229,16 +268,30 @@ def main() -> None:
     parser.add_argument("--out", default=None, help="directory for traces + report")
     parser.add_argument("--noise-floor-only", action="store_true",
                         help="run only BF16 vs BF16, to validate determinism first")
+    parser.add_argument("--rebuild-for-int4", action="store_true",
+                        help="load the checkpoint twice instead of deep-copying "
+                             "(~13 GB less host RAM, slower startup)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     if args.out:
         os.makedirs(args.out, exist_ok=True)
 
-    print("building BF16 model ...")
-    bf16 = build_bf16_model(args.repo, args.weight_dir, args.device)
-    bf16_mem = resident_memory(bf16)
-    print(f"  resident: {bf16_mem.total / 2**30:.2f} GiB")
+    if args.noise_floor_only:
+        print("building BF16 model on CPU ...")
+        bf16 = build_bf16_model(args.repo, args.weight_dir)
+        bf16_mem = resident_memory(bf16)
+        print(f"  resident: {bf16_mem.total / 2**30:.2f} GiB")
+        print(f"moving to {args.device} ...")
+        bf16 = bf16.to(args.device).eval()
+        int4 = result = config = memory = None
+    else:
+        bf16, int4, result, config, memory = build_model_pair(
+            args.repo, args.weight_dir, args
+        )
+        bf16_mem = resident_memory(bf16)
+        print("  " + result.summary().replace("\n", "\n  "))
+        print("  " + memory.describe())
 
     decoder = load_llada_decoder(args.repo)
     print(f"  decoder: {decoder.describe()}")
@@ -297,15 +350,7 @@ def main() -> None:
               f"min={min(imbalances):.2f} max={max(imbalances):.2f}")
 
     # --- 1 + 2. INT4-MSE vs BF16 -----------------------------------------
-    print(f"\n[int4] quantizing (group_size={args.group_size}, "
-          f"scale_search={args.scale_search}) ...")
-    int4, result, config = make_int4_model(
-        bf16, args.group_size, args.scale_search, args.device
-    )
-    memory = compare_resident_memory(bf16, int4, label="INT4 PACKED")
-    print("  " + result.summary().replace("\n", "\n  "))
-    print("  " + memory.describe())
-
+    print("\n[int4] Mode A + Mode B against BF16 ...")
     _, int4_free, mode_a, mode_b = run_pair(
         "int4", bf16, int4, prompt_ids, args, decoder, logits_fn
     )
