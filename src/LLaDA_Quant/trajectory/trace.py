@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-TRACE_FORMAT_VERSION = 1
+TRACE_FORMAT_VERSION = 2
 
 
 class MetricPrecision(str, Enum):
@@ -81,6 +81,16 @@ class TraceStep:
     committed_tokens: List[int] = field(default_factory=list)
     topk_ids: List[List[int]] = field(default_factory=list)
     """``[masked_positions, k]`` predicted token ids at masked slots."""
+    argmax_ids: List[int] = field(default_factory=list)
+    """The ``argmax`` token id per masked slot, stored explicitly.
+
+    Not the same as ``topk_ids[i][0]`` when the top two logits are exactly
+    equal: ``torch.topk`` and ``torch.argmax`` are free to break ties
+    differently. The decoder calls ``argmax``, so that is what the trace has to
+    record — deriving top-1 from the top-k slice made replay disagree with
+    capture by ~6 points on a checkpoint whose masked-position logits are
+    riddled with exact ties.
+    """
     topk_logprobs: List[List[float]] = field(default_factory=list)
     """Matching log-probabilities. Enough to recompute agreement and a
     truncated KL offline, not enough to recompute the exact one."""
@@ -97,6 +107,7 @@ class TraceStep:
             "committed_positions": self.committed_positions,
             "committed_tokens": self.committed_tokens,
             "topk_ids": self.topk_ids,
+            "argmax_ids": self.argmax_ids,
             "topk_logprobs": self.topk_logprobs,
             "layers": {k: v.to_dict() for k, v in self.layers.items()},
             "scalars": {k: v.to_dict() for k, v in self.scalars.items()},
@@ -112,6 +123,7 @@ class TraceStep:
             committed_positions=data.get("committed_positions", []),
             committed_tokens=data.get("committed_tokens", []),
             topk_ids=data.get("topk_ids", []),
+            argmax_ids=data.get("argmax_ids", []),
             topk_logprobs=data.get("topk_logprobs", []),
             layers={k: LayerStats(**v) for k, v in data.get("layers", {}).items()},
             scalars={k: ScalarMetric(**v) for k, v in data.get("scalars", {}).items()},

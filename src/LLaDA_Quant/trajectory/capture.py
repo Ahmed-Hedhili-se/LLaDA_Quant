@@ -62,15 +62,19 @@ def _as_mapping(
 
 def _topk_slice(
     logits: torch.Tensor, mask: torch.Tensor, k: int
-) -> tuple[List[List[int]], List[List[float]]]:
-    """Top-k ids and log-probs at masked positions, as plain Python lists."""
+) -> tuple[List[List[int]], List[List[float]], List[int]]:
+    """Top-k ids, log-probs, and the argmax id at masked positions.
+
+    The argmax is taken separately rather than read off ``topk``: on exactly
+    tied logits the two are free to disagree, and the decoder uses ``argmax``.
+    """
     selected = logits[mask]
     if selected.numel() == 0:
-        return [], []
+        return [], [], []
     k = min(k, selected.shape[-1])
     logprobs = F.log_softmax(selected.float(), dim=-1)
     values, indices = logprobs.topk(k, dim=-1)
-    return indices.tolist(), values.tolist()
+    return indices.tolist(), values.tolist(), selected.argmax(dim=-1).tolist()
 
 
 def _layer_stats(
@@ -105,7 +109,7 @@ def _step_record(
     top_k: int,
     store_router_ids: bool,
 ) -> TraceStep:
-    ids, logprobs = _topk_slice(logits, mask, top_k)
+    ids, logprobs, argmax_ids = _topk_slice(logits, mask, top_k)
     record = TraceStep(
         step=state.step,
         num_masked=state.num_masked,
@@ -113,6 +117,7 @@ def _step_record(
         masked_positions=mask.reshape(-1).nonzero(as_tuple=True)[0].tolist(),
         topk_ids=ids,
         topk_logprobs=logprobs,
+        argmax_ids=argmax_ids,
         layers=_layer_stats(routers, gates, top_k, store_router_ids),
     )
     record.scalars["entropy_masked"] = _exact(

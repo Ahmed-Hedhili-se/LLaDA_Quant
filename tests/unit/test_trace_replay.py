@@ -239,3 +239,31 @@ def test_report_distinguishes_per_step_error_from_amplification():
     report = TrajectoryReport(mode_a=mode_a, mode_b=mode_b)
     assert report.to_dict()["mode_a_shared_state"]["mode"] == "shared"
     assert report.to_dict()["mode_b_free_running"]["mode"] == "free_running"
+
+
+def test_argmax_is_stored_not_derived_from_topk():
+    """topk and argmax may disagree on exactly tied logits; the decoder uses
+    argmax, so the trace records it explicitly."""
+    model = ToyDiffusionLM().eval()
+    capture = capture_shared(model, model, states(), logits_fn)
+    step = capture.reference.steps[0]
+    assert step.argmax_ids, "argmax must be captured"
+    assert len(step.argmax_ids) == len(step.topk_ids)
+    report = replay_shared(capture.reference, capture.quantized)
+    assert "stored argmax" in report.steps[0].replayed["top1_agreement"].note
+    assert verify_replay(report) == []
+
+
+def test_replay_matches_capture_when_logits_are_exactly_tied(tmp_path):
+    """The regime that exposed the bug: every masked logit tied, so topk's
+    tie-break diverges from argmax's."""
+    import torch.nn as nn
+
+    class TiedLM(nn.Module):
+        def forward(self, input_ids):
+            return torch.zeros(*input_ids.shape, 8)
+
+    tied = TiedLM().eval()
+    capture = capture_shared(tied, tied, states(), logits_fn)
+    problems = verify_replay(replay_shared(capture.reference, capture.quantized))
+    assert problems == [], f"replay drifted from capture on tied logits: {problems}"

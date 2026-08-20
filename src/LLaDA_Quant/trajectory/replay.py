@@ -85,11 +85,17 @@ def replay_shared(reference: Trace, quantized: Trace) -> ReplayReport:
         entry = ReplayedStep(step=ref_step.step)
         if ref_step.topk_ids and qnt_step.topk_ids:
             pairs = list(zip(ref_step.topk_ids, qnt_step.topk_ids))
-            top1 = sum(1 for a, b in pairs if a and b and a[0] == b[0]) / len(pairs)
             overlap = sum(_jaccard(a, b) for a, b in pairs) / len(pairs)
-            entry.replayed["top1_agreement"] = _topk(
-                top1, "argmax of the stored top-k; equals exact top-1 agreement"
-            )
+            # Use the stored argmax, never topk[0]: they disagree on exactly
+            # tied logits, and the decoder uses argmax.
+            if ref_step.argmax_ids and qnt_step.argmax_ids:
+                argmax_pairs = list(zip(ref_step.argmax_ids, qnt_step.argmax_ids))
+                top1 = sum(1 for a, b in argmax_pairs if a == b) / len(argmax_pairs)
+                note = "stored argmax per position; equals exact top-1 agreement"
+            else:
+                top1 = sum(1 for a, b in pairs if a and b and a[0] == b[0]) / len(pairs)
+                note = "argmax of the stored top-k; differs on exact ties"
+            entry.replayed["top1_agreement"] = _topk(top1, note)
             entry.replayed["topk_set_overlap"] = _topk(
                 overlap, f"Jaccard over the stored top-{reference.top_k_stored} ids"
             )
