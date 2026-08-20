@@ -124,6 +124,7 @@ def search_group_scale(
     bits: int,
     grid: int = 24,
     max_shrink: float = 0.5,
+    chunk_elements: int = 64_000_000,
 ) -> torch.Tensor:
     """Per-group scale minimising squared reconstruction error.
 
@@ -160,6 +161,24 @@ def search_group_scale(
     if not 0.0 <= max_shrink < 1.0:
         raise ValueError(f"max_shrink must lie in [0, 1), got {max_shrink}")
 
+    # Chunk along the leading axis. A fused expert tensor is [E, 2I, H] --
+    # 268M elements for LLaDA -- and the search needs an fp32 working copy plus
+    # a temporary of the same size. Unchunked that is several GB of transient
+    # allocation per call, which OOMs a GPU that is also holding a model.
+    if chunk_elements > 0 and w_g.dim() > 1 and w_g.shape[0] > 1:
+        per_row = w_g[0].numel()
+        rows = max(1, chunk_elements // max(1, per_row))
+        if rows < w_g.shape[0]:
+            return torch.cat(
+                [
+                    search_group_scale(
+                        w_g[start : start + rows], bits, grid, max_shrink, chunk_elements
+                    )
+                    for start in range(0, w_g.shape[0], rows)
+                ],
+                dim=0,
+            )
+
     qmax, qmin = qmax_for_bits(bits), qmin_for_bits(bits)
     wf = w_g.float()
     base = _amax_scale(w_g, bits)
@@ -170,8 +189,14 @@ def search_group_scale(
         ratio = 1.0 - max_shrink * step / grid
         candidate = base * ratio
         safe = torch.where(candidate > 0, candidate, torch.ones_like(candidate))
-        q = torch.round(wf / safe).clamp(qmin, qmax)
-        err = ((q * safe - wf) ** 2).sum(dim=-1, keepdim=True)
+        # One working tensor, mutated in place: quantize, dequantize, subtract,
+        # square. The readable form allocates four tensors of this size per
+        # grid step, which is what made a 268M-element block need ~5 GB.
+        work = wf / safe
+        work.round_().clamp_(qmin, qmax)
+        work.mul_(safe).sub_(wf)
+        err = work.pow_(2).sum(dim=-1, keepdim=True)
+        del work
         better = err < best_err
         best_err = torch.where(better, err, best_err)
         best_scale = torch.where(better, candidate, best_scale)

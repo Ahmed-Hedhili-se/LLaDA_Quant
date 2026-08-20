@@ -197,38 +197,52 @@ def build_model_pair(repo: str, weight_dir: str, args):
     swaps -- swapping turns a two-minute build into half an hour.
     """
     config = int4_config(args.group_size, args.scale_search, args.search_grid)
+    where = args.quantize_device or args.device
+
+    if args.rebuild_for_int4:
+        # Quantize FIRST, while the GPU is still empty. The scale search needs
+        # several GB of transient VRAM per block; running it with the 13.7 GB
+        # reference already resident is what OOMs. Afterwards the INT4 model is
+        # only ~3.2 GB, so the reference fits comfortably alongside it.
+        print("building the model to quantize, on CPU ...")
+        int4 = build_bf16_model(repo, weight_dir)
+
+        step = _timer(f"quantizing on {where} (group_size={args.group_size}, "
+                      f"scale_search={args.scale_search}, grid={args.search_grid})")
+        result = (
+            quantize_model(int4, config)
+            if where == "cpu"
+            else quantize_experts_streaming(int4, config, where)
+        )
+        step()
+        int4 = int4.to(args.device).eval()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print("building the BF16 reference on CPU ...")
+        bf16 = build_bf16_model(repo, weight_dir)
+        memory = compare_resident_memory(bf16, int4, label="INT4 PACKED")
+        print(f"moving BF16 reference to {args.device} ...")
+        bf16 = bf16.to(args.device).eval()
+        return bf16, int4, result, config, memory
 
     print("building BF16 model on CPU ...")
     bf16 = build_bf16_model(repo, weight_dir)
+    print("deep-copying for INT4 (host RAM peak ~27 GB) ...")
+    int4 = copy.deepcopy(bf16)
 
-    if args.rebuild_for_int4:
-        # Park the reference on the GPU first; the host then holds one model
-        # at a time. Deep-copying instead would keep both here at once.
-        print(f"moving BF16 to {args.device} to free host RAM ...")
-        bf16 = bf16.to(args.device).eval()
-        print("rebuilding a second copy for INT4 (--rebuild-for-int4) ...")
-        int4 = build_bf16_model(repo, weight_dir)
-    else:
-        print("deep-copying for INT4 (host RAM peak ~27 GB) ...")
-        int4 = copy.deepcopy(bf16)
-
-    where = args.quantize_device or args.device
     step = _timer(f"quantizing on {where} (group_size={args.group_size}, "
                   f"scale_search={args.scale_search}, grid={args.search_grid})")
-    if where == "cpu":
-        result = quantize_model(int4, config)
-    else:
-        result = quantize_experts_streaming(int4, config, where)
+    result = (
+        quantize_model(int4, config)
+        if where == "cpu"
+        else quantize_experts_streaming(int4, config, where)
+    )
     step()
-
-    # Byte accounting only; it does not care which device either model is on.
     memory = compare_resident_memory(bf16, int4, label="INT4 PACKED")
-
-    print(f"moving INT4 to {args.device} ...")
+    print(f"moving both models to {args.device} ...")
     int4 = int4.to(args.device).eval()
-    if not args.rebuild_for_int4:
-        print(f"moving BF16 to {args.device} ...")
-        bf16 = bf16.to(args.device).eval()
+    bf16 = bf16.to(args.device).eval()
     return bf16, int4, result, config, memory
 
 

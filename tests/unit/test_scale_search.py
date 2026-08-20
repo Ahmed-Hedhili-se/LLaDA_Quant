@@ -198,3 +198,18 @@ def test_search_survives_a_checkpoint_roundtrip(tmp_path, moe_model):
     manifest = load_quantized_weights(fresh, str(tmp_path))
     assert manifest.config.scale_search == "mse"
     assert torch.equal(fresh.layers[0].mlp.w1, moe_model.layers[0].mlp.w1)
+
+
+def test_chunking_is_exact_and_bounds_memory(heavy_tailed):
+    """A 268M-element expert tensor needs an fp32 copy plus a temporary; doing
+    that unchunked is several GB of transient VRAM per block."""
+    w_g, _ = _as_groups(heavy_tailed, 128)
+    whole = search_group_scale(w_g, bits=4, grid=8, chunk_elements=0)
+    chunked = search_group_scale(w_g, bits=4, grid=8, chunk_elements=1024)
+    assert torch.equal(whole, chunked), "chunking must not change the result"
+    assert chunked.shape == whole.shape
+
+
+def test_chunking_handles_a_single_row():
+    w_g = torch.randn(1, 4, 64)
+    assert search_group_scale(w_g, bits=4, grid=4, chunk_elements=1).shape == (1, 4, 1)
