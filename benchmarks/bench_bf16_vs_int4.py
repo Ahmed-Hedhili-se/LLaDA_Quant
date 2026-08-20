@@ -152,9 +152,10 @@ def build_model_pair(repo: str, weight_dir: str, args):
     before either model is moved; the pair then needs ~16.1 GB of VRAM instead of
     ~25.8 GB. On a 24 GB card the naive order (move, then deep-copy) OOMs.
 
-    ``--rebuild-for-int4`` loads the checkpoint a second time instead of
-    deep-copying, trading load time for ~13 GB less host RAM. Use it if the
-    server has less than ~32 GB of system memory.
+    ``--rebuild-for-int4`` moves the reference to the GPU *before* building the
+    second model, so only one model is ever in host RAM: peak ~13.7 GB instead
+    of ~27.4 GB. It costs a second weight load (~90 s). Worth it on a box that
+    swaps -- swapping turns a two-minute build into half an hour.
     """
     config = int4_config(args.group_size, args.scale_search)
 
@@ -162,25 +163,30 @@ def build_model_pair(repo: str, weight_dir: str, args):
     bf16 = build_bf16_model(repo, weight_dir)
 
     if args.rebuild_for_int4:
+        # Park the reference on the GPU first; the host then holds one model
+        # at a time. Deep-copying instead would keep both here at once.
+        print(f"moving BF16 to {args.device} to free host RAM ...")
+        bf16 = bf16.to(args.device).eval()
         print("rebuilding a second copy for INT4 (--rebuild-for-int4) ...")
         int4 = build_bf16_model(repo, weight_dir)
     else:
-        print("deep-copying for INT4 (host RAM peak ~26 GB) ...")
+        print("deep-copying for INT4 (host RAM peak ~27 GB) ...")
         int4 = copy.deepcopy(bf16)
 
-    print(f"quantizing on CPU (group_size={args.group_size}, "
-          f"scale_search={args.scale_search}) ...")
+    step = _timer(f"quantizing on CPU (group_size={args.group_size}, "
+                  f"scale_search={args.scale_search})")
     result = quantize_model(int4, config)
+    step()
+
+    # Byte accounting only; it does not care which device either model is on.
     memory = compare_resident_memory(bf16, int4, label="INT4 PACKED")
 
-    print(f"moving both models to {args.device} ...")
-    return (
-        bf16.to(args.device).eval(),
-        int4.to(args.device).eval(),
-        result,
-        config,
-        memory,
-    )
+    print(f"moving INT4 to {args.device} ...")
+    int4 = int4.to(args.device).eval()
+    if not args.rebuild_for_int4:
+        print(f"moving BF16 to {args.device} ...")
+        bf16 = bf16.to(args.device).eval()
+    return bf16, int4, result, config, memory
 
 
 # --------------------------------------------------------------------------
@@ -301,8 +307,8 @@ def main() -> None:
     parser.add_argument("--noise-floor-only", action="store_true",
                         help="run only BF16 vs BF16, to validate determinism first")
     parser.add_argument("--rebuild-for-int4", action="store_true",
-                        help="load the checkpoint twice instead of deep-copying "
-                             "(~13 GB less host RAM, slower startup)")
+                        help="hold one model in host RAM at a time (~13.7 GB peak "
+                             "instead of ~27.4 GB) at the cost of a second weight load")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
