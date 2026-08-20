@@ -78,6 +78,19 @@ from LLaDA_Quant.trajectory import (
 # --------------------------------------------------------------------------
 
 
+def _timer(label: str):
+    """Print a stage banner now and its duration when the returned fn is called."""
+    import time
+
+    print(f"  {label} ...", flush=True)
+    start = time.perf_counter()
+
+    def done() -> None:
+        print(f"  {label}: {time.perf_counter() - start:.1f}s", flush=True)
+
+    return done
+
+
 def build_bf16_model(repo: str, weight_dir: str):
     """Build the fused-MoE BF16 model on CPU, the way the inference repo does.
 
@@ -90,15 +103,34 @@ def build_bf16_model(repo: str, weight_dir: str):
     from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
     from src.model import load_weights
 
-    model = LLaDAMoEKV(use_fused_moe=False).to(torch.bfloat16).eval()
+    # Construct directly in BF16. The unfused model is 3072 expert Linears
+    # (64 experts x 3 projections x 16 layers); at the default fp32 that is
+    # ~25.6 GB of randomly initialised host memory, plus another 12.8 GB for
+    # the .to(bfloat16) copy. On a box with less RAM than that it swaps, and
+    # construction takes tens of minutes instead of a couple.
+    step = _timer("allocating unfused model (BF16)")
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        model = LLaDAMoEKV(use_fused_moe=False)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    model = model.to(torch.bfloat16).eval()
+    step()
+
+    step = _timer("loading weights")
     load_weights(model, weight_dir, verbose=False)
+    step()
 
     # Fuse AFTER loading: load_state_dict_from_unfused writes w1[i] in place,
     # which is precisely what PACKED mode cannot accept.
-    for layer in model.layers:
+    step = _timer(f"fusing {len(model.layers)} MoE blocks")
+    for index, layer in enumerate(model.layers):
         fused = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
         fused.load_state_dict_from_unfused(layer.mlp)
         layer.mlp = fused
+        print(f"    layer {index + 1}/{len(model.layers)} fused", flush=True)
+    step()
     return model.eval()
 
 
