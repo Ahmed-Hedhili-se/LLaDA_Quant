@@ -134,15 +134,54 @@ def build_bf16_model(repo: str, weight_dir: str):
     return model.eval()
 
 
-def int4_config(group_size: int, search: str) -> QuantConfig:
+def int4_config(group_size: int, search: str, search_grid: int = 24) -> QuantConfig:
     return QuantConfig(
         bits=4,
         group_size=group_size,
         targets=("expert",),
         execution_mode=ExecutionMode.PACKED.value,
         scale_search=search,
+        search_grid=search_grid,
         expect_expert_blocks=LLADA_MOE_7B_A1B.num_layers,
     )
+
+
+def quantize_experts_streaming(model, config, device, verbose: bool = True):
+    """Quantize expert blocks one at a time on ``device``.
+
+    MSE scale search is ``search_grid`` passes over every weight, each
+    allocating GB-scale temporaries. On 6.4B parameters that is tens of minutes
+    of CPU. On a GPU it is seconds -- but the whole BF16 second model does not
+    fit next to the reference, so blocks are moved across one at a time.
+
+    Peak VRAM is the reference (~13.7 GB) plus the packed buffers accumulated so
+    far (growing to ~3.2 GB) plus one block's BF16 weights in flight (~1.6 GB).
+
+    Bypasses ``api.quantize_model`` because that quantizes the whole tree at
+    once, so the match-count assertion is re-applied here by hand.
+    """
+    from LLaDA_Quant.adapters.llada_moe import find_expert_blocks, quantize_llada_experts
+    from LLaDA_Quant.api import QuantizationResult, TargetingError
+
+    blocks = find_expert_blocks(model, config)
+    expected = config.expect_expert_blocks
+    if expected is not None and len(blocks) != expected:
+        raise TargetingError(
+            f"expected {expected} expert block(s), matched {len(blocks)}: "
+            f"{[name for name, _, _ in blocks]}"
+        )
+    if not blocks:
+        raise TargetingError("quantization matched no expert blocks")
+
+    records = []
+    for index, (name, block, _shape) in enumerate(blocks, start=1):
+        block.to(device)
+        for record in quantize_llada_experts(block, config):
+            record.name = name or record.name
+            records.append(record)
+        if verbose:
+            print(f"    {index}/{len(blocks)} {name} quantized on {device}", flush=True)
+    return QuantizationResult(config=config, targets=records)
 
 
 def build_model_pair(repo: str, weight_dir: str, args):
@@ -157,7 +196,7 @@ def build_model_pair(repo: str, weight_dir: str, args):
     of ~27.4 GB. It costs a second weight load (~90 s). Worth it on a box that
     swaps -- swapping turns a two-minute build into half an hour.
     """
-    config = int4_config(args.group_size, args.scale_search)
+    config = int4_config(args.group_size, args.scale_search, args.search_grid)
 
     print("building BF16 model on CPU ...")
     bf16 = build_bf16_model(repo, weight_dir)
@@ -173,9 +212,13 @@ def build_model_pair(repo: str, weight_dir: str, args):
         print("deep-copying for INT4 (host RAM peak ~27 GB) ...")
         int4 = copy.deepcopy(bf16)
 
-    step = _timer(f"quantizing on CPU (group_size={args.group_size}, "
-                  f"scale_search={args.scale_search})")
-    result = quantize_model(int4, config)
+    where = args.quantize_device or args.device
+    step = _timer(f"quantizing on {where} (group_size={args.group_size}, "
+                  f"scale_search={args.scale_search}, grid={args.search_grid})")
+    if where == "cpu":
+        result = quantize_model(int4, config)
+    else:
+        result = quantize_experts_streaming(int4, config, where)
     step()
 
     # Byte accounting only; it does not care which device either model is on.
@@ -297,6 +340,12 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--scale-search", choices=("amax", "mse"), default="mse")
+    parser.add_argument("--search-grid", type=int, default=24,
+                        help="clipping ratios tried by the MSE search; 8 captures "
+                             "almost all of the gain at a third of the cost")
+    parser.add_argument("--quantize-device", default=None,
+                        help="where to run quantization (default: --device). "
+                             "'cpu' is tens of minutes on 6.4B weights")
     parser.add_argument("--ratios", type=float, nargs="+", default=[1.0, 0.75, 0.5, 0.25])
     parser.add_argument("--reference-completion", default=None,
                         help="JSON list of token ids to reveal in Mode A "
