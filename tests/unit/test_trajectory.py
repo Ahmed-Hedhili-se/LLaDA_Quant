@@ -149,6 +149,25 @@ def test_diffusion_state_validates_shapes():
         DiffusionState(step=0, input_ids=ids, mask_positions=torch.zeros(1, 5, dtype=torch.bool))
 
 
+def test_diffusion_state_rejects_a_split_device_state():
+    """A CPU/CUDA-mixed state used to construct fine and fail later, inside the
+    caller's indexing. `meta` stands in for a second device without a GPU."""
+    ids = torch.zeros(1, 4, dtype=torch.long)
+    with pytest.raises(ValueError, match="must live on one device"):
+        DiffusionState(
+            step=0,
+            input_ids=ids,
+            mask_positions=torch.zeros(1, 4, dtype=torch.bool, device="meta"),
+        )
+    with pytest.raises(ValueError, match="must live on one device"):
+        DiffusionState(
+            step=0,
+            input_ids=ids,
+            mask_positions=ids.bool(),
+            attention_mask=torch.ones(1, 4, device="meta"),
+        )
+
+
 def test_mask_positions_from_ids():
     ids = torch.tensor([[1, MASK_ID, 3, MASK_ID]])
     assert mask_positions_from_ids(ids, MASK_ID).tolist() == [[False, True, False, True]]

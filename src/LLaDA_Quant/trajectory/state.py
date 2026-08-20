@@ -59,6 +59,17 @@ class DiffusionState:
             self.input_ids.shape
         ):
             raise ValueError("attention_mask must have the same shape as input_ids")
+        # A state split across devices is always a bug, and it surfaces far from
+        # its cause: construction succeeds, then the caller's indexing fails.
+        for name, tensor in (
+            ("mask_positions", self.mask_positions),
+            ("attention_mask", self.attention_mask),
+        ):
+            if tensor is not None and tensor.device != self.input_ids.device:
+                raise ValueError(
+                    f"{name} is on {tensor.device} but input_ids is on "
+                    f"{self.input_ids.device}; a DiffusionState must live on one device"
+                )
 
     @property
     def num_masked(self) -> int:

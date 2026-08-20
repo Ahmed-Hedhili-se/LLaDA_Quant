@@ -298,8 +298,9 @@ def capture_free_running(
 
             newly = (mask & ~nxt.mask_positions.to(mask.device).bool()).reshape(-1)
             committed = newly.nonzero(as_tuple=True)[0]
+            flat_ids = nxt.input_ids.reshape(-1)
             record.committed_positions = committed.tolist()
-            record.committed_tokens = nxt.input_ids.reshape(-1)[committed].tolist()
+            record.committed_tokens = flat_ids[committed.to(flat_ids.device)].tolist()
             traces[label].steps.append(record)
 
             runner[2] = nxt

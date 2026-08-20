@@ -109,7 +109,12 @@ def make_llada_advance_fn(
     budget: dict[int, torch.Tensor] = {}
 
     def advance(state: DiffusionState, logits: torch.Tensor) -> Optional[DiffusionState]:
-        mask_index = state.mask_positions.to(logits.device).bool()
+        # Everything downstream is derived from `logits`, so pull the state onto
+        # its device once. Returning a state with CPU ids and CUDA mask
+        # positions would be silently accepted here and blow up later, in the
+        # caller's indexing.
+        device = logits.device
+        mask_index = state.mask_positions.to(device).bool()
         if not bool(mask_index.any()):
             return None
         if not budget:
@@ -134,14 +139,15 @@ def make_llada_advance_fn(
         if not bool(transfer_index.any()):
             return None
 
-        input_ids = state.input_ids.clone()
+        input_ids = state.input_ids.to(device).clone()
         input_ids[transfer_index] = x0[transfer_index]
         next_mask = mask_index & ~transfer_index
+        attention_mask = state.attention_mask
         return DiffusionState(
             step=state.step + 1,
             input_ids=input_ids,
             mask_positions=next_mask,
-            attention_mask=state.attention_mask,
+            attention_mask=None if attention_mask is None else attention_mask.to(device),
             label=f"step {state.step + 1}",
         )
 
