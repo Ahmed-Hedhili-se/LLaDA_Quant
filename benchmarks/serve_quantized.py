@@ -73,10 +73,15 @@ def main() -> None:
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
-    # init_distributed() expects a rendezvous even for a single process.
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29511")
-
+    # Do NOT pre-set MASTER_ADDR here. init_distributed() fills in the whole
+    # single-process rendezvous (MASTER_ADDR, MASTER_PORT, RANK, WORLD_SIZE)
+    # but only when MASTER_ADDR is absent:
+    #
+    #     if world_size == 1 and "MASTER_ADDR" not in os.environ:
+    #
+    # Setting just MASTER_ADDR defeats that guard and leaves RANK unset, which
+    # fails inside torch's env:// rendezvous. Under torchrun all four are
+    # already present and this is a no-op either way.
     import src.server as server
     from model_update.distributed import get_tp_rank, get_tp_size, init_distributed
 
