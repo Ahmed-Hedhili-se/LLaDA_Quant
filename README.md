@@ -690,6 +690,7 @@ Three categories, each stating what it measures and what it does not.
 | `bench_numerical.py` | B — numerical | weight and output quantization error | latency — both paths run the same BF16 matmul |
 | `bench_moe_regime.py` | decision | tokens/expert, GEMM shapes, roofline side | wall-clock anything |
 | `bench_bf16_vs_int4.py` | validation | BF16 vs INT4-MSE on the **real** checkpoint: router overlap, token commits, final output, against a BF16-vs-BF16 floor | latency; needs a GPU, never yet run |
+| `bench_generation_latency.py` | C' — cost | wall clock of dequantize-then-matmul INT4 vs BF16, forward and full generation | a fused kernel; INT4 is expected to be **slower** |
 | *(none yet)* | C — kernel | BF16 vs INT8 vs INT4 fused MoE | **the kernel does not exist** |
 | *(none yet)* | D — end to end | tokens/s, latency, memory, batch, steps | needs the inference repo and a GPU |
 
