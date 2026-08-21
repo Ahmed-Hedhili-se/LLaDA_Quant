@@ -28,6 +28,7 @@ here reports a benefit from it.
 | Trajectory capture, trace, offline replay, noise floor | IMPLEMENTED |
 | Router top-k capture from the real fused block | IMPLEMENTED |
 | BF16 vs INT4 experiment on the real checkpoint | IMPLEMENTED, **MEASURED** |
+| GSM8K accuracy, BF16 vs INT4, same machine | **MEASURED** (n=50, not significant) |
 | **Fused INT8/INT4 Triton MoE kernel** | **FUTURE — does not exist** |
 | Latency or throughput speedup | **NOT CLAIMED, NOT MEASURED** |
 
@@ -198,6 +199,49 @@ rows per expert, the busiest sees ~130 — above the A6000's W4A16 crossover of 
 while the average is well below it, so the critical-path expert may be
 compute-bound where the average one is not. That weakens the case for a
 weight-only kernel and belongs in the regime analysis.
+
+### GSM8K accuracy
+
+`MEASURED` — RTX A6000, LLaDA-MoE-7B-A1B-Instruct, n=50 seed=42,
+`max_tokens=1024 steps=512 block_length=64 confidence_threshold=0.9` (the
+inference repo's recommended config), INT4 group 128 with MSE scale search in
+REFERENCE mode. Both arms served through the same launcher, differing only in
+quantization.
+
+| | accuracy | correct |
+|---|---|---|
+| BF16 baseline | 70.0% | 35/50 |
+| INT4-MSE g128 | **64.0%** | 32/50 |
+
+Paired breakdown, since the two arms answered the same questions:
+
+| | items |
+|---|---|
+| both correct | 28 |
+| both wrong | 11 |
+| **INT4 fixed what BF16 got wrong** | **4** |
+| **INT4 broke what BF16 got right** | **7** |
+
+**McNemar exact test on the 11 discordant items: p = 0.549.** The 6-point gap
+is not statistically detectable at n=50 — one standard error on a 70% rate here
+is +/-6.5 points, wider than the gap itself. INT4 is not *shown* to be worse;
+neither is it shown to be safe.
+
+The number that does mean something is the churn: **22% of items changed
+outcome**, in both directions. That is the task-level shadow of what the
+trajectory layer measured directly — 47.7% token divergence and 4.59x
+amplification. Aggregate accuracy is roughly preserved while individual answers
+are not stable. If per-response reproducibility matters for a deployment, that
+churn is the finding, not the 6 points.
+
+Note the baseline: 70.0%, not the 88.0% the inference repo recorded on an
+A40-24Q at this exact config (and 77.4% on a third machine). An 18-point spread
+across three GPUs with identical code and seed means **only a same-machine
+BF16-vs-INT4 delta is interpretable**, never a comparison against a number
+measured elsewhere.
+
+Resolving a 6-point difference needs roughly n=200; at ~7.4 s/question that is
+about 25 minutes per arm.
 
 ### Extrapolated to the real model
 
