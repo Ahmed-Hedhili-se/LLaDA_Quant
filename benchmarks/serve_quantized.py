@@ -127,6 +127,19 @@ def main() -> None:
         else:
             print("PACKED mode: real memory reduction, ~7x slower per forward.\n")
 
+    # Expose what is actually being served. Without this there is no way to
+    # tell a quantized server from a BF16 one over HTTP, and forgetting to
+    # restart between arms silently produces two identical result files that
+    # look like a clean "quantization changed nothing" finding.
+    @server.app.get("/v1/quantization")
+    def quantization_status() -> dict:
+        return dict(served)
+
+    print("=" * 62)
+    print(f"  SERVING: {served['label']}")
+    print(f"  verify with: curl -s http://localhost:{args.port}/v1/quantization")
+    print("=" * 62 + "\n")
+
     if get_tp_size() > 1 and get_tp_rank() != 0:
         print(f"Rank {get_tp_rank()} waiting for generation tasks...")
         server.worker_loop()
