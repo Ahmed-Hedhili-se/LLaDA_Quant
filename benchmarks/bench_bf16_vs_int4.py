@@ -113,9 +113,8 @@ def build_bf16_model(repo: str, weight_dir: str, build_device: str = "cpu"):
     if not os.path.exists(index):
         raise FileNotFoundError(
             f"no checkpoint index at {index}. Cloning the inference repo does not "
-            "bring the ~14 GB of weights; fetch them first, e.g.
-"
-            "  huggingface-cli download inclusionAI/LLaDA-MoE-7B-A1B-Instruct "
+            "bring the ~14 GB of weights; fetch them first, e.g.  "
+            "huggingface-cli download inclusionAI/LLaDA-MoE-7B-A1B-Instruct "
             f"--local-dir {weight_dir}"
         )
 
