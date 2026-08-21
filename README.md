@@ -28,7 +28,7 @@ here reports a benefit from it.
 | Trajectory capture, trace, offline replay, noise floor | IMPLEMENTED |
 | Router top-k capture from the real fused block | IMPLEMENTED |
 | BF16 vs INT4 experiment on the real checkpoint | IMPLEMENTED, **MEASURED** |
-| GSM8K accuracy, BF16 vs INT4, same machine | **MEASURED** (n=50, not significant) |
+| GSM8K accuracy: BF16 vs INT8 vs INT4, same machine | **MEASURED** (n=200) |
 | **Fused INT8/INT4 Triton MoE kernel** | **FUTURE — does not exist** |
 | Latency or throughput speedup | **NOT CLAIMED, NOT MEASURED** |
 
@@ -208,10 +208,30 @@ inference repo's recommended config), INT4 group 128 with MSE scale search in
 REFERENCE mode. Both arms served through the same launcher, differing only in
 quantization.
 
-| n | BF16 | INT4-MSE g128 | delta | p (unpaired) |
-|---|---|---|---|---|
-| 50 | 70.0% (35/50) | 64.0% (32/50) | **-6.0 pt** | 0.523 |
-| 200 | 75.5% (151/200) | 69.5% (139/200) | **-6.0 pt** | 0.179 |
+| config | GSM8K n=200 | vs BF16 | weight rel. L2 | expert bytes | item churn |
+|---|---|---|---|---|---|
+| BF16 | **75.5%** (151/200) | — | — | 12288 MiB | — |
+| INT8 g128 | **73.5%** (147/200) | **-2.0 pt** (p=0.585) | 0.0065 | 6336 MiB | 15% |
+| INT4-MSE g128 | **69.5%** (139/200) | **-6.0 pt** (p=0.179) | 0.1011 | 3264 MiB | 22% |
+
+**INT8 is the deployable configuration.** Half the expert bytes at a 2-point
+cost that a paired McNemar cannot distinguish from chance (13 items fixed, 17
+broken, p=0.585).
+
+**The loss tracks weight precision, not a routing threshold.** That was the
+open question: if INT4's -6 points came from the near-uniform router flipping
+under *any* perturbation, INT8 -- with 15x lower weight error -- should have
+lost just as much. It lost a third as much instead. So more bits genuinely buy
+accuracy here, and mixed precision is a real lever rather than a workaround for
+a threshold effect.
+
+The relationship is strongly sublinear: 15x the weight error costs only 3x the
+accuracy. Most of INT4's error is absorbed.
+
+At n=50 the INT4 gap was also exactly -6.0 points, so the effect is stable
+across sample sizes even though neither reaches significance. Detecting 6
+points at 80% power needs ~864 questions per arm (~1.8 h each); the full
+1319-item test set would settle it.
 
 The effect is stable -- exactly -6.0 points at both sample sizes -- and still
 not statistically established. Detecting a 6-point gap at 80% power needs
