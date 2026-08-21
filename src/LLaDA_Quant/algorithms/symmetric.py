@@ -314,14 +314,36 @@ def pack_int4(q8: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_int4(packed: torch.Tensor) -> torch.Tensor:
-    """Inverse of ``pack_int4`` (sign-extends nibbles 8..15 to -8..-1)."""
-    shape = packed.shape
-    p = packed.to(torch.int16) & 0xFF
-    lo = p & 0x0F
-    hi = (p >> 4) & 0x0F
-    lo = torch.where(lo >= 8, lo - 16, lo)
-    hi = torch.where(hi >= 8, hi - 16, hi)
-    return torch.stack([lo, hi], dim=-1).reshape(*shape[:-1], shape[-1] * 2).to(torch.int8)
+    """Inverse of ``pack_int4`` (sign-extends nibbles 8..15 to -8..-1).
+
+    Stays in int8 and uses arithmetic shifts to sign-extend, rather than
+    widening to int16 and branching with ``torch.where``:
+
+    * ``packed >> 4`` is an arithmetic shift, so the high nibble arrives
+      already sign-extended from bit 7.
+    * ``(packed << 4) >> 4`` moves the low nibble into the sign position and
+      shifts it back, sign-extending it the same way.
+
+    This matters well out of proportion to its size. The previous version
+    allocated six int16 temporaries plus a ``stack``/``reshape`` copy -- about
+    2 GB of traffic for one 268M-element expert tensor, against the 536 MB it
+    would cost merely to read that weight in BF16. Since PACKED mode
+    dequantizes on *every* access, that overhead landed on every forward of
+    every layer.
+    """
+    if packed.dtype != torch.int8:
+        raise ValueError(f"packed int4 storage must be int8, got {packed.dtype}")
+    low = (packed << 4) >> 4
+    high = packed >> 4
+    out = torch.empty(
+        *packed.shape[:-1],
+        packed.shape[-1] * 2,
+        dtype=torch.int8,
+        device=packed.device,
+    )
+    out[..., 0::2] = low
+    out[..., 1::2] = high
+    return out
 
 
 def storage_bytes(numel: int, bits: int, group_size: int, scale_bytes: int = 4) -> int:

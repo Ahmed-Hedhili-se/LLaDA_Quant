@@ -176,3 +176,38 @@ def test_int4_and_int8_both_reconstruct_after_a_forward(moe_model):
         out = clone.layers[0].mlp(x)
         relative = (out - reference).abs().max() / reference.abs().max()
         assert relative < tolerance, f"INT{bits} relative error {relative:.3f}"
+
+
+def test_unpack_sign_extension_is_exhaustively_correct():
+    """Arithmetic-shift unpacking must match the reference for every byte.
+
+    The int8 shift trick relies on `>>` being an arithmetic (sign-propagating)
+    shift. If that ever changed, low-nibble values 8..15 would decode as
+    positive instead of -8..-1, silently corrupting half of every INT4 weight.
+    """
+    def reference(packed):
+        p = packed.to(torch.int16) & 0xFF
+        lo, hi = p & 0x0F, (p >> 4) & 0x0F
+        lo = torch.where(lo >= 8, lo - 16, lo)
+        hi = torch.where(hi >= 8, hi - 16, hi)
+        shape = packed.shape
+        return torch.stack([lo, hi], -1).reshape(*shape[:-1], shape[-1] * 2).to(torch.int8)
+
+    every_byte = torch.arange(-128, 128, dtype=torch.int8).reshape(1, 256)
+    assert torch.equal(unpack_int4(every_byte), reference(every_byte))
+
+
+def test_every_int4_pair_survives_a_roundtrip():
+    values = torch.arange(-8, 8, dtype=torch.int8)
+    pairs = torch.stack(torch.meshgrid(values, values, indexing="ij"), -1).reshape(1, -1)
+    assert torch.equal(unpack_int4(pack_int4(pairs)), pairs)
+
+
+def test_unpack_rejects_non_int8_storage():
+    with pytest.raises(ValueError, match="must be int8"):
+        unpack_int4(torch.zeros(4, dtype=torch.int16))
+
+
+def test_unpack_preserves_leading_dimensions():
+    packed = torch.randint(-128, 127, (3, 5, 8), dtype=torch.int8)
+    assert unpack_int4(packed).shape == (3, 5, 16)
