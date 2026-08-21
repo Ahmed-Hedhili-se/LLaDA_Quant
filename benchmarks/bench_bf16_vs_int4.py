@@ -109,6 +109,16 @@ def build_bf16_model(repo: str, weight_dir: str, build_device: str = "cpu"):
     from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
     from src.model import load_weights
 
+    index = os.path.join(weight_dir, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        raise FileNotFoundError(
+            f"no checkpoint index at {index}. Cloning the inference repo does not "
+            "bring the ~14 GB of weights; fetch them first, e.g.
+"
+            "  huggingface-cli download inclusionAI/LLaDA-MoE-7B-A1B-Instruct "
+            f"--local-dir {weight_dir}"
+        )
+
     # Construct directly in BF16. The unfused model is 3072 expert Linears
     # (64 experts x 3 projections x 16 layers); at the default fp32 that is
     # ~25.6 GB of randomly initialised memory, plus another 12.8 GB for the
@@ -214,7 +224,7 @@ def build_model_pair(repo: str, weight_dir: str, args):
         # several GB of transient VRAM per block; running it with the 13.7 GB
         # reference already resident is what OOMs. Afterwards the INT4 model is
         # only ~3.2 GB, so the reference fits comfortably alongside it.
-        print("building the model to quantize, on CPU ...")
+        print(f"building the model to quantize, on {args.build_device} ...")
         int4 = build_bf16_model(repo, weight_dir, args.build_device)
 
         step = _timer(f"quantizing on {where} (group_size={args.group_size}, "
@@ -229,14 +239,14 @@ def build_model_pair(repo: str, weight_dir: str, args):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        print("building the BF16 reference on CPU ...")
+        print(f"building the BF16 reference on {args.build_device} ...")
         bf16 = build_bf16_model(repo, weight_dir, args.build_device)
         memory = compare_resident_memory(bf16, int4, label="INT4 PACKED")
         print(f"moving BF16 reference to {args.device} ...")
         bf16 = bf16.to(args.device).eval()
         return bf16, int4, result, config, memory
 
-    print("building BF16 model on CPU ...")
+    print(f"building BF16 model on {args.build_device} ...")
     bf16 = build_bf16_model(repo, weight_dir, args.build_device)
     print("deep-copying for INT4 (host RAM peak ~27 GB) ...")
     int4 = copy.deepcopy(bf16)
@@ -393,7 +403,7 @@ def main() -> None:
         os.makedirs(args.out, exist_ok=True)
 
     if args.noise_floor_only:
-        print("building BF16 model on CPU ...")
+        print(f"building BF16 model on {args.build_device} ...")
         bf16 = build_bf16_model(args.repo, args.weight_dir, args.build_device)
         bf16_mem = resident_memory(bf16)
         print(f"  resident: {bf16_mem.total / 2**30:.2f} GiB")
