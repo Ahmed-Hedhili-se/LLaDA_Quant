@@ -152,7 +152,29 @@ class Trace:
 
     @property
     def final_tokens(self) -> List[int]:
-        """Committed tokens in commit order across the whole trajectory."""
+        """The generated sequence, in **position** order — what you decode.
+
+        A diffusion decoder commits by confidence, not left to right, so commit
+        order is not reading order. Concatenating ``committed_tokens`` as they
+        arrive scrambles the text: ``Natalia`` comes out ``iaNatal`` and the
+        answer ``72`` reads as ``27``, which looks exactly like a model
+        producing nonsense rather than a reconstruction bug.
+
+        Each token is therefore placed at the position it was committed to.
+        Positions never committed are omitted.
+        """
+        slots: Dict[int, int] = {}
+        for step in self.steps:
+            slots.update(zip(step.committed_positions, step.committed_tokens))
+        return [slots[position] for position in sorted(slots)]
+
+    @property
+    def commit_order_tokens(self) -> List[int]:
+        """Committed tokens in the order the decoder chose them.
+
+        The trajectory's shape, not its text. Useful for comparing *when* two
+        decodes committed what; useless for decoding.
+        """
         out: List[int] = []
         for step in self.steps:
             out.extend(step.committed_tokens)

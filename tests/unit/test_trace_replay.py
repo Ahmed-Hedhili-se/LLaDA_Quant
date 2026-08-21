@@ -267,3 +267,35 @@ def test_replay_matches_capture_when_logits_are_exactly_tied(tmp_path):
     capture = capture_shared(tied, tied, states(), logits_fn)
     problems = verify_replay(replay_shared(capture.reference, capture.quantized))
     assert problems == [], f"replay drifted from capture on tied logits: {problems}"
+
+
+def test_final_tokens_are_ordered_by_position_not_commit_order():
+    """A diffusion decoder commits by confidence, so commit order scrambles text.
+
+    Concatenating committed_tokens as they arrive turned 'Natalia' into
+    'iaNatal' and the answer '72' into '27' on the real checkpoint -- which
+    reads as a broken model rather than a broken reconstruction.
+    """
+    trace = Trace(mode="free_running", prompt_length=0, gen_length=4)
+    # committed out of order: position 3 first, then 0, then 1 and 2
+    trace.steps.append(TraceStep(step=1, num_masked=4, mask_ratio=1.0,
+                                 committed_positions=[3], committed_tokens=[103]))
+    trace.steps.append(TraceStep(step=2, num_masked=3, mask_ratio=0.75,
+                                 committed_positions=[0], committed_tokens=[100]))
+    trace.steps.append(TraceStep(step=3, num_masked=2, mask_ratio=0.5,
+                                 committed_positions=[2, 1], committed_tokens=[102, 101]))
+
+    assert trace.final_tokens == [100, 101, 102, 103], "must read in position order"
+    assert trace.commit_order_tokens == [103, 100, 102, 101], "commit order preserved"
+
+
+def test_final_tokens_survives_a_json_roundtrip(tmp_path):
+    model = ToyDiffusionLM().eval()
+    capture = capture_free_running(model, model, _start(6), logits_fn, make_advance_fn(1))
+    path = tmp_path / "t.json"
+    capture.reference.save(str(path))
+    assert Trace.load(str(path)).final_tokens == capture.reference.final_tokens
+
+
+def test_final_tokens_is_empty_before_anything_commits():
+    assert Trace(mode="free_running").final_tokens == []
