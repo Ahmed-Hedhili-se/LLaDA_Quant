@@ -281,22 +281,51 @@ def make_logits_fn(device: str):
     return logits_fn
 
 
-def encode_prompt(repo: str, weight_dir: str, prompt: str) -> torch.Tensor:
-    if repo not in sys.path:
-        sys.path.insert(0, repo)
-    from transformers import AutoTokenizer
+_TOKENIZER = None
 
-    tok = AutoTokenizer.from_pretrained(weight_dir, trust_remote_code=True)
+
+def get_tokenizer(repo: str, weight_dir: str):
+    """Cached tokenizer. Loading it per call re-parses a 7.7 MB tokenizer.json."""
+    global _TOKENIZER
+    if _TOKENIZER is None:
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        from transformers import AutoTokenizer
+
+        _TOKENIZER = AutoTokenizer.from_pretrained(weight_dir, trust_remote_code=True)
+    return _TOKENIZER
+
+
+def encode_prompt(
+    repo: str, weight_dir: str, prompt: str, chat_template: bool = False
+) -> torch.Tensor:
+    """Tokenize the prompt, optionally through the model's chat template.
+
+    LLaDA-MoE-7B-A1B-**Instruct** was tuned on chat-formatted input. Feeding it
+    a bare ``Question:/Answer:`` string is out of distribution, and it shows:
+    the model emits one short span and then padding, so both BF16 and INT4
+    produce the same degenerate output and the comparison measures nothing.
+    """
+    tok = get_tokenizer(repo, weight_dir)
+    if chat_template:
+        if getattr(tok, "chat_template", None) is None:
+            raise ValueError(
+                "--chat-template was requested but this tokenizer defines none; "
+                "drop the flag or supply the formatted prompt yourself"
+            )
+        prompt = tok.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
     return torch.tensor([tok(prompt)["input_ids"]], dtype=torch.long)
 
 
-def decode_tokens(repo: str, weight_dir: str, ids: torch.Tensor) -> str:
-    if repo not in sys.path:
-        sys.path.insert(0, repo)
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(weight_dir, trust_remote_code=True)
-    return tok.decode(ids.reshape(-1).tolist(), skip_special_tokens=True)
+def decode_tokens(
+    repo: str, weight_dir: str, ids: torch.Tensor, skip_special: bool = True
+) -> str:
+    tok = get_tokenizer(repo, weight_dir)
+    return tok.decode(ids.reshape(-1).tolist(), skip_special_tokens=skip_special)
 
 
 # --------------------------------------------------------------------------
@@ -376,6 +405,10 @@ def main() -> None:
     parser.add_argument("--search-grid", type=int, default=24,
                         help="clipping ratios tried by the MSE search; 8 captures "
                              "almost all of the gain at a third of the cost")
+    parser.add_argument("--chat-template", action="store_true",
+                        help="wrap the prompt in the model chat template. The "
+                             "checkpoint is an Instruct model, so a bare prompt is "
+                             "out of distribution and yields degenerate output")
     parser.add_argument("--build-device", default="cpu",
                         help="where to construct the model: 'cpu' is safe anywhere; "
                              "'cuda:0' is seconds instead of ~100s but needs ~14 GB "
@@ -420,7 +453,9 @@ def main() -> None:
     decoder = load_llada_decoder(args.repo)
     print(f"  decoder: {decoder.describe()}")
     logits_fn = make_logits_fn(args.device)
-    prompt_ids = encode_prompt(args.repo, args.weight_dir, args.prompt)
+    prompt_ids = encode_prompt(
+        args.repo, args.weight_dir, args.prompt, chat_template=args.chat_template
+    )
     print(f"  prompt: {prompt_ids.shape[1]} tokens, generating {args.gen_length}")
 
     # --- 3. noise floor first: BF16 against itself ------------------------
@@ -493,9 +528,22 @@ def main() -> None:
             print("  " + line)
 
     print("\n[final output]")
+    # Report how much of the generation is real content. When a prompt is out
+    # of distribution the model emits a short span and then pads, and both
+    # models "agree" on output that says nothing about quantization.
+    for name, ids in (("BF16", int4_free.reference), ("INT4", int4_free.quantized)):
+        tokens = ids.final_tokens
+        kept = decode_tokens(args.repo, args.weight_dir, torch.tensor(tokens), True)
+        raw = decode_tokens(args.repo, args.weight_dir, torch.tensor(tokens), False)
+        print(f"  {name}: {len(tokens)} committed, "
+              f"{len(kept.split())} word(s) after dropping special tokens")
+        if len(kept.strip()) < 10:
+            print(f"    WARNING: near-empty output. Raw: {raw[:160]!r}")
+            print("    A degenerate generation makes the BF16/INT4 comparison "
+                  "meaningless; try --chat-template.")
     for name, ids in (("BF16", int4_free.reference), ("INT4", int4_free.quantized)):
         text = decode_tokens(args.repo, args.weight_dir, torch.tensor(ids.final_tokens))
-        print(f"  {name}: {text!r}")
+        print(f"    {name} text: {text!r}")
 
     report.update({
         "quantization": {
