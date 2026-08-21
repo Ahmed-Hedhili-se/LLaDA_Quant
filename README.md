@@ -27,7 +27,7 @@ here reports a benefit from it.
 | MoE roofline / tokens-per-expert analysis | IMPLEMENTED, MEASURED |
 | Trajectory capture, trace, offline replay, noise floor | IMPLEMENTED |
 | Router top-k capture from the real fused block | IMPLEMENTED |
-| BF16 vs INT4 experiment on the real checkpoint | **WRITTEN, NOT YET RUN** |
+| BF16 vs INT4 experiment on the real checkpoint | IMPLEMENTED, **MEASURED** |
 | **Fused INT8/INT4 Triton MoE kernel** | **FUTURE — does not exist** |
 | Latency or throughput speedup | **NOT CLAIMED, NOT MEASURED** |
 
@@ -153,6 +153,51 @@ error is ~15x INT8's, and output cosine drops to 0.94 on heavy-tailed weights.
 Scale search makes INT4 meaningfully better; it does not make it obviously
 safe. Establishing that needs the trajectory layer against the real
 checkpoint, and probably mixed precision.
+
+### On the real checkpoint
+
+`MEASURED` — `bench_bf16_vs_int4.py`, RTX A6000 48 GB, LLaDA-MoE-7B-A1B-Instruct,
+INT4 group 128 with MSE scale search, one GSM8K prompt through the chat
+template, 128 tokens / 128 steps, greedy (temperature 0), seed 42.
+
+| | BF16 | INT4-MSE |
+|---|---|---|
+| expert weights | 12288 MiB | **3264 MiB (0.266x)** |
+| whole model resident | 14032 MiB | **5008 MiB (0.357x)** |
+
+| quantity | INT4 | BF16-vs-BF16 floor |
+|---|---|---|
+| Mode A mean top-1 agreement | 0.8861 | 1.0000 |
+| Mode A mean tie fraction | 0.9733 | 0.0000 |
+| Mode B final token agreement | **0.4766** | 1.0000 |
+| Mode B first divergence step | **34** of 128 | never |
+| Mode B commit-order agreement | **0.2109** | 1.0000 |
+| amplification (Mode B / Mode A) | **4.59x** | — |
+
+**The trajectory diverges hard; the answer does not.** Fewer than half the
+committed tokens match, the commit *order* barely agrees at all, and end-to-end
+divergence is 4.6x the per-step injected error — errors genuinely compound along
+the schedule. Yet both decodes reach `oxed{72}`, correctly, with coherent
+reasoning, differing only in how they write the intermediate step
+(`rac{48}{2}` versus `rac{1}{2} 	imes 48`).
+
+This is the concrete case for why text equality is the wrong gate. It would
+score this run a failure at 47.7% token agreement, while the task is solved
+identically. It is equally the case against declaring success from one prompt:
+n=1 shows the failure mode is *survivable here*, not that it is safe.
+
+Read Mode A's 0.886 next to its 0.973 tie fraction: per-step error is small and
+almost entirely lands on positions where the reference had no real preference.
+The damage is not per-step — it is in what those coin-tosses compound into.
+
+**Routing imbalance is not mild.** Measured max/mean load per expert across the
+16 layers: **2.50x to 6.48x** (A6000, 179 tokens; the A40-24Q gave 2.65-7.12x at
+two shorter lengths). The inference repo's note that a near-uniform router
+probably means mild imbalance does not survive measurement. With mean load ~20
+rows per expert, the busiest sees ~130 — above the A6000's W4A16 crossover of 50
+while the average is well below it, so the critical-path expert may be
+compute-bound where the average one is not. That weakens the case for a
+weight-only kernel and belongs in the regime analysis.
 
 ### Extrapolated to the real model
 
@@ -774,9 +819,11 @@ repo, which needs Triton and CUDA).
 1. **v0.2 (current)** — packed INT8/INT4, honest memory modes, self-contained
    checkpoints, safe targeting, split benchmarks, trajectory trace/replay,
    MoE regime analysis.
-2. **v0.3** — measured trajectory + noise floor on the real LLaDA-MoE
-   checkpoint; real `topk_ids` routing statistics to replace the ideal-balance
-   assumption. This is also what decides whether INT4 is usable at all: scale
+2. **v0.3** — *(trajectory, noise floor and routing statistics on the real
+   checkpoint are now measured; see [On the real checkpoint](#on-the-real-checkpoint))*.
+   What remains is the verdict that matters: GSM8K n=50 seed=42 against the
+   inference repo's 88.0% baseline. One prompt reaching the right answer is not
+   an accuracy result. This is also what decides whether INT4 is usable at all: scale
    search narrows the gap, sensitivity-driven mixed precision (INT4 where a
    layer tolerates it, INT8 where it does not) is the likely next step, and a
    data-aware method (GPTQ/AWQ) is the fallback if neither suffices.
