@@ -44,7 +44,7 @@ here reports a benefit from it.
 
 - [What actually happens when you quantize](#what-actually-happens-when-you-quantize)
 - [Execution modes](#execution-modes)
-- [Measured results](#measured-results)
+- [Measured results](#measured-results)  — full experimental report in [RESULTS.md](RESULTS.md)
 - [Quick start](#quick-start)
 - [Targeting is explicit](#targeting-is-explicit)
 - [Checkpoint format](#checkpoint-format)
@@ -111,6 +111,11 @@ Packed buffers *and* dequantized BF16 Parameters both resident.
 ---
 
 ## Measured results
+
+> Consolidated experimental report with interpretation, including the
+> accuracy, latency, trajectory and routing measurements on the real
+> checkpoint: **[RESULTS.md](RESULTS.md)**.
+
 
 `MEASURED` — `benchmarks/bench_storage.py --num-experts 16 --hidden 1024 --intermediate 512 --layers 2`, BF16 baseline 96.00 MiB:
 
