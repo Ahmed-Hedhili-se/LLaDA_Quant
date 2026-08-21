@@ -208,12 +208,17 @@ inference repo's recommended config), INT4 group 128 with MSE scale search in
 REFERENCE mode. Both arms served through the same launcher, differing only in
 quantization.
 
-| | accuracy | correct |
-|---|---|---|
-| BF16 baseline | 70.0% | 35/50 |
-| INT4-MSE g128 | **64.0%** | 32/50 |
+| n | BF16 | INT4-MSE g128 | delta | p (unpaired) |
+|---|---|---|---|---|
+| 50 | 70.0% (35/50) | 64.0% (32/50) | **-6.0 pt** | 0.523 |
+| 200 | 75.5% (151/200) | 69.5% (139/200) | **-6.0 pt** | 0.179 |
 
-Paired breakdown, since the two arms answered the same questions:
+The effect is stable -- exactly -6.0 points at both sample sizes -- and still
+not statistically established. Detecting a 6-point gap at 80% power needs
+roughly **864 questions per arm** (~1.8 h each at 7.3 s/question); the full
+1319-item GSM8K test set would settle it.
+
+Paired breakdown at n=50, since the two arms answered the same questions:
 
 | | items |
 |---|---|
@@ -226,6 +231,11 @@ Paired breakdown, since the two arms answered the same questions:
 is not statistically detectable at n=50 — one standard error on a 70% rate here
 is +/-6.5 points, wider than the gap itself. INT4 is not *shown* to be worse;
 neither is it shown to be safe.
+
+At n=200 the same -6.0 point gap reaches only p = 0.179, by an *unpaired*
+two-proportion test. The paired test would be sharper, but the harness's result
+JSON stores only the aggregate, not per-item outcomes, so pipe stdout through
+``tee`` if you want McNemar at that size.
 
 The number that does mean something is the churn: **22% of items changed
 outcome**, in both directions. That is the task-level shadow of what the
