@@ -91,12 +91,18 @@ def _timer(label: str):
     return done
 
 
-def build_bf16_model(repo: str, weight_dir: str):
-    """Build the fused-MoE BF16 model on CPU, the way the inference repo does.
+def build_bf16_model(repo: str, weight_dir: str, build_device: str = "cpu"):
+    """Build the fused-MoE BF16 model, the way the inference repo does.
 
-    Deliberately stays on the host: both models have to be resident at once for
-    the comparison, and 2 x 12.88 GB of BF16 experts does not fit on a 24 GB
-    card. Quantize first, move second.
+    ``build_device`` decides where construction happens, and it is a pure
+    speed/VRAM trade:
+
+    * ``"cpu"`` (default): safe anywhere. Random-initialising 6.4B parameters
+      and fusing 16 blocks costs ~100 s of host CPU.
+    * ``"cuda:0"``: the same work on the GPU takes seconds, but the unfused
+      model is ~14 GB of VRAM before fusing and the comparison needs a second
+      model afterwards. Only worth it with roughly 40 GB or more; on a 24 GB
+      card two BF16 models do not fit at all, which is why CPU is the default.
     """
     if repo not in sys.path:
         sys.path.insert(0, repo)
@@ -105,14 +111,15 @@ def build_bf16_model(repo: str, weight_dir: str):
 
     # Construct directly in BF16. The unfused model is 3072 expert Linears
     # (64 experts x 3 projections x 16 layers); at the default fp32 that is
-    # ~25.6 GB of randomly initialised host memory, plus another 12.8 GB for
-    # the .to(bfloat16) copy. On a box with less RAM than that it swaps, and
+    # ~25.6 GB of randomly initialised memory, plus another 12.8 GB for the
+    # .to(bfloat16) copy. On a host with less RAM than that it swaps, and
     # construction takes tens of minutes instead of a couple.
-    step = _timer("allocating unfused model (BF16)")
+    step = _timer(f"allocating unfused model (BF16) on {build_device}")
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
-        model = LLaDAMoEKV(use_fused_moe=False)
+        with torch.device(build_device):
+            model = LLaDAMoEKV(use_fused_moe=False)
     finally:
         torch.set_default_dtype(previous_dtype)
     model = model.to(torch.bfloat16).eval()
@@ -124,12 +131,15 @@ def build_bf16_model(repo: str, weight_dir: str):
 
     # Fuse AFTER loading: load_state_dict_from_unfused writes w1[i] in place,
     # which is precisely what PACKED mode cannot accept.
-    step = _timer(f"fusing {len(model.layers)} MoE blocks")
+    step = _timer(f"fusing {len(model.layers)} MoE blocks on {build_device}")
     for index, layer in enumerate(model.layers):
-        fused = TritonFusedMoEBlock(layer.mlp.cfg).to(torch.bfloat16)
+        with torch.device(build_device):
+            fused = TritonFusedMoEBlock(layer.mlp.cfg)
+        fused = fused.to(device=build_device, dtype=torch.bfloat16)
         fused.load_state_dict_from_unfused(layer.mlp)
         layer.mlp = fused
-        print(f"    layer {index + 1}/{len(model.layers)} fused", flush=True)
+        if build_device == "cpu":
+            print(f"    layer {index + 1}/{len(model.layers)} fused", flush=True)
     step()
     return model.eval()
 
@@ -205,7 +215,7 @@ def build_model_pair(repo: str, weight_dir: str, args):
         # reference already resident is what OOMs. Afterwards the INT4 model is
         # only ~3.2 GB, so the reference fits comfortably alongside it.
         print("building the model to quantize, on CPU ...")
-        int4 = build_bf16_model(repo, weight_dir)
+        int4 = build_bf16_model(repo, weight_dir, args.build_device)
 
         step = _timer(f"quantizing on {where} (group_size={args.group_size}, "
                       f"scale_search={args.scale_search}, grid={args.search_grid})")
@@ -220,14 +230,14 @@ def build_model_pair(repo: str, weight_dir: str, args):
             torch.cuda.empty_cache()
 
         print("building the BF16 reference on CPU ...")
-        bf16 = build_bf16_model(repo, weight_dir)
+        bf16 = build_bf16_model(repo, weight_dir, args.build_device)
         memory = compare_resident_memory(bf16, int4, label="INT4 PACKED")
         print(f"moving BF16 reference to {args.device} ...")
         bf16 = bf16.to(args.device).eval()
         return bf16, int4, result, config, memory
 
     print("building BF16 model on CPU ...")
-    bf16 = build_bf16_model(repo, weight_dir)
+    bf16 = build_bf16_model(repo, weight_dir, args.build_device)
     print("deep-copying for INT4 (host RAM peak ~27 GB) ...")
     int4 = copy.deepcopy(bf16)
 
@@ -357,6 +367,10 @@ def main() -> None:
     parser.add_argument("--search-grid", type=int, default=24,
                         help="clipping ratios tried by the MSE search; 8 captures "
                              "almost all of the gain at a third of the cost")
+    parser.add_argument("--build-device", default="cpu",
+                        help="where to construct the model: 'cpu' is safe anywhere; "
+                             "'cuda:0' is seconds instead of ~100s but needs ~14 GB "
+                             "of VRAM during construction (use on a 40 GB+ card)")
     parser.add_argument("--quantize-device", default=None,
                         help="where to run quantization (default: --device). "
                              "'cpu' is tens of minutes on 6.4B weights")
@@ -380,7 +394,7 @@ def main() -> None:
 
     if args.noise_floor_only:
         print("building BF16 model on CPU ...")
-        bf16 = build_bf16_model(args.repo, args.weight_dir)
+        bf16 = build_bf16_model(args.repo, args.weight_dir, args.build_device)
         bf16_mem = resident_memory(bf16)
         print(f"  resident: {bf16_mem.total / 2**30:.2f} GiB")
         print(f"moving to {args.device} ...")
