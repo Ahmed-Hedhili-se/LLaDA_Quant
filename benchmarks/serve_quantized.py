@@ -95,8 +95,14 @@ def main() -> None:
     server.load_model(weight_dir, device, args.backend)
 
     if args.no_quantize:
-        print(f"\nserving BF16 unmodified "
-              f"({resident_memory(server.MODEL).total / 2**30:.2f} GiB resident)\n")
+        resident = resident_memory(server.MODEL).total
+        print(f"\nserving BF16 unmodified ({resident / 2**30:.2f} GiB resident)\n")
+        served = {
+            "quantized": False,
+            "label": "BF16 (unmodified baseline)",
+            "resident_bytes": resident,
+            "backend": args.backend,
+        }
     else:
         if args.backend != "fast_dense":
             raise SystemExit(
@@ -126,6 +132,16 @@ def main() -> None:
                   "using more memory. Correct choice for accuracy evaluation.\n")
         else:
             print("PACKED mode: real memory reduction, ~7x slower per forward.\n")
+        served = {
+            "quantized": True,
+            "label": (f"INT{args.bits} g{args.group_size} {args.scale_search} "
+                      f"{args.execution_mode}"),
+            "config": config.to_dict(),
+            "expert_blocks": len(result.expert_blocks),
+            "resident_bytes": after.total,
+            "resident_ratio": round(after.total / before.total, 4),
+            "backend": args.backend,
+        }
 
     # Expose what is actually being served. Without this there is no way to
     # tell a quantized server from a BF16 one over HTTP, and forgetting to
