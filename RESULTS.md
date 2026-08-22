@@ -190,6 +190,48 @@ round trip.
 cases and runs on tensor cores identically. INT4 never reaches a tensor core as
 INT4. The entire gap is dequantization sitting in front of an unchanged GEMM.
 
+### Fixing it: two solutions, measured
+
+`MEASURED` on the A6000, expert-GEMM shape K=2048 N=16384 (64 MiB weight, past
+L2 so it streams from HBM as a real forward does), L2 flushed between timings.
+
+| M/expert | BF16 | eager INT8 | **compile** | **fused kernel** |
+|---|---|---|---|---|
+| 4 | 1.00x | 8.68x slower | 2.21x slower | **1.96x FASTER** |
+| 16 | 1.00x | 9.40x slower | 2.37x slower | **1.93x FASTER** |
+| 64 | 1.00x | 9.15x slower | 2.28x slower | **1.56x FASTER** |
+| 128 | 1.00x | 8.25x slower | 2.17x slower | **1.10x FASTER** |
+| 256 | 1.00x | 6.70x slower | 1.93x slower | 0.78x slower |
+
+**Solution 1 — `torch.compile` the dequantize** (`QuantConfig(compile_dequant=True)`).
+Fuses the four elementwise kernels into one: 6.1x faster than eager at INT8,
+10.1x at INT4, and **bit-identical** on both. But it tops out at 1.22 ms against
+a 1.19 ms floor, and is still ~2.2x slower than BF16. It cannot win: the
+expanded weight must still land in HBM for ``fused_moe`` to read back, so the
+compiled path moves 1280 MiB where BF16 moves 512.
+
+**Solution 2 — dequantize inside the GEMM's K-loop**
+(`runtime/kernels/w8a16_gemm.py`). The int8 tile is expanded in registers,
+consumed by one `tl.dot`, discarded. No BF16 weight ever exists: 32 KB in
+registers instead of 512 MiB in HBM. **1.96x faster than BF16**, 4.3x ahead of
+solution 1, rel L2 3.05e-05 against the reference.
+
+**Only solution 2 ever beats the baseline.** Solution 1 is damage limitation —
+useful when PACKED mode's memory is needed today, turning ~3.4 tok/s into
+~13 tok/s against BF16's 21, but never a win.
+
+The fused kernel crosses back over between M=128 and M=256 (parity near ~170).
+The roofline predicted 101, so it is conservative by about 1.7x — close enough
+that the regime table can be planned against, and in the safe direction.
+
+**Caveat:** that kernel is a plain GEMM. No `moe_align_block_size`, no routing,
+no top-k weighting, **no SiLU epilogue** — and the epilogue holds two B tiles in
+flight, roughly doubling register pressure, which is where a 2x can evaporate.
+It proves in-register dequantization wins; it is not a drop-in for `fused_moe`.
+The realistic path is porting the `use_int8_w8a16` branch back into that kernel
+from upstream vLLM, whose signature it already carries, with 3.05e-05 as the
+numerical bar.
+
 ---
 
 ## 6. Trajectory divergence
