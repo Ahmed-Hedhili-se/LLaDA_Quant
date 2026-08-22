@@ -148,6 +148,7 @@ def attach_packed_buffers(
     block: nn.Module,
     weights: QuantExpertWeights,
     compute_dtype: torch.dtype,
+    compile_dequant: bool = False,
 ) -> None:
     """Register ``_qw1``/``_sw1``/``_qw2``/``_sw2`` and the metadata to read them."""
     block.register_buffer("_qw1", weights.w1.q, persistent=True)
@@ -162,9 +163,37 @@ def attach_packed_buffers(
             "group_size": weights.w1.group_size,
             "packed": weights.w1.packed,
             "compute_dtype": compute_dtype,
+            "compile_dequant": compile_dequant,
             "logical_shape": {W1: weights.w1.logical_shape, W2: weights.w2.logical_shape},
         },
     )
+
+
+_COMPILED_DEQUANT = None
+
+
+def compiled_dequantize():
+    """``dequantize_tensor`` fused into a single elementwise kernel.
+
+    Eager dequantization runs four kernels — unpack, upcast, scale, downcast —
+    each making its own round trip through HBM. On one 268M-element expert
+    tensor that is 7.49 ms against the 0.77 ms it costs merely to read the BF16
+    weight. Compiled it is **1.22 ms**, against a 1.19 ms floor for reading the
+    packed bytes and writing BF16, so the fusion is essentially optimal for an
+    out-of-kernel dequantize.
+
+    It cannot reach BF16 parity, and no amount of compilation will: the
+    expanded weight still has to land in HBM for ``fused_moe`` to read back.
+    Removing *that* round trip needs the dequantize inside the GEMM's inner
+    loop. This is the cheap 6x, not the fix.
+
+    Compiled lazily and cached: ``torch.compile`` costs seconds on first call
+    and the guards then specialise per shape.
+    """
+    global _COMPILED_DEQUANT
+    if _COMPILED_DEQUANT is None:
+        _COMPILED_DEQUANT = torch.compile(dequantize_tensor, dynamic=False)
+    return _COMPILED_DEQUANT
 
 
 def _packed_expert_weight(self: nn.Module, which: str) -> torch.Tensor:
@@ -176,7 +205,8 @@ def _packed_expert_weight(self: nn.Module, which: str) -> torch.Tensor:
             "load_quantized_weights() so the quantization config is applied."
         )
     suffix = which[-1]
-    return dequantize_tensor(
+    dequantize = compiled_dequantize() if meta.get("compile_dequant") else dequantize_tensor
+    return dequantize(
         getattr(self, f"_qw{suffix}"),
         getattr(self, f"_sw{suffix}"),
         meta["bits"],

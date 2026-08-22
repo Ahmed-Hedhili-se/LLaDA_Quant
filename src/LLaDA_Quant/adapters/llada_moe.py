@@ -131,7 +131,7 @@ def quantize_llada_experts(model: nn.Module, config: QuantConfig) -> List[Target
             scale_search=config.scale_search,
             search_grid=config.search_grid,
         )
-        attach_packed_buffers(block, weights, compute_dtype)
+        attach_packed_buffers(block, weights, compute_dtype, config.compile_dequant)
 
         if mode is ExecutionMode.PACKED:
             install_packed_expert_access(block)
@@ -176,7 +176,7 @@ def restore_llada_experts_from_buffers(model: nn.Module, config: QuantConfig) ->
             w1=quant_result_from_buffers(block._qw1, block._sw1, config.bits),
             w2=quant_result_from_buffers(block._qw2, block._sw2, config.bits),
         )
-        attach_packed_buffers(block, weights, compute_dtype)
+        attach_packed_buffers(block, weights, compute_dtype, config.compile_dequant)
         if config.mode is ExecutionMode.PACKED:
             if not is_packed_expert_block(block):
                 install_packed_expert_access(block)

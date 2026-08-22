@@ -68,6 +68,7 @@ class QuantConfig:
     scale_dtype: str = "float32"
     scale_search: str = "amax"
     search_grid: int = 24
+    compile_dequant: bool = False
     source_checkpoint: Optional[str] = None
     expect_expert_blocks: Optional[int] = None
     expect_linears: Optional[int] = None
