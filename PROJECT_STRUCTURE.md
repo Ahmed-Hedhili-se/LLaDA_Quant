@@ -193,13 +193,31 @@ needs no cooperation from the checkpoint format or a future kernel, and why
 the tests assert equal `storage_bytes()` between the two. It is specifically an
 INT4 tool — 256 levels absorb an outlier, 16 do not, so INT8 gains ~0%.
 
-### `algorithms/calibration.py`, `algorithms/outliers.py` (4 lines each)
+### `algorithms/calibration.py`, `algorithms/outliers.py` — empty by decision
 
-Intentional stubs, with the reasoning in the docstring: weight-only symmetric
-min-max has **no input dependence**, so calibration data cannot change a single
-scale. These become real only alongside a data-aware algorithm (GPTQ/AWQ
-activation-scale search) or activation quantization. They exist as named
-placeholders so nobody re-derives that conclusion.
+Both hold an argument instead of code, so the reasoning does not have to be
+re-derived. They are not unfinished work.
+
+**`calibration.py`.** The scale is `s = max(abs(W_group)) / Qmax` — there is no
+activation term, so calibration data cannot move a single scale. A
+`calibrate(model, batches)` here would consume data, run forwards, and emit a
+bit-identical checkpoint. It becomes real only under data-aware weight
+quantization (GPTQ's Hessian, AWQ's per-channel search) or activation
+quantization. The docstring carries the measured case for when that is worth
+building: INT4 runs ~15x INT8's weight error for −6 GSM8K points, clipping
+search recovered 13%, AWQ-class methods typically recover 2–4x — so it matters
+only if INT4 specifically is needed, which the memory numbers do not currently
+justify.
+
+**`outliers.py`.** This one was actively misleading before: it implied nothing
+handles outliers. Two things do. Groupwise scaling contains them structurally —
+at `group_size=128` one large weight inflates the step for its own 128
+neighbours and no others, which is exactly what per-tensor scaling fails to do.
+And clipping search in `symmetric.search_group_scale` remediates the rest,
+measured at 12–14% lower INT4 error for zero extra bytes. What is genuinely
+absent is SmoothQuant-style per-channel migration (only relevant once
+activations are quantized) and outlier-level mixed precision, which needs a
+sensitivity measurement that does not exist yet.
 
 ---
 
