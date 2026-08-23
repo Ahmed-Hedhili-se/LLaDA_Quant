@@ -5,9 +5,16 @@ checkpoint through the inference repository's own model, decoder, server and
 grader. Nothing is extrapolated unless it says so.
 
 **Headline:** INT8 halves the expert weights at no measurable accuracy cost.
-INT4 saves twice as much again for a probable ~6-point accuracy loss. Neither is
-faster — both are ~6x *slower* per forward, because no kernel consumes packed
-weights yet. Quantization today is a **capacity win, not a speed win**.
+INT4 saves twice as much again for a probable ~6-point accuracy loss. As
+*served* today, both are ~6x *slower* per forward, because the grouped-expert
+MoE path still dequantizes into HBM before an unchanged BF16 GEMM — so the
+deployed model is a **capacity win, not a speed win**.
+
+That is a property of the wiring, not of quantization. The fused W8A16 GEMM in
+[section 5](#5-speed) dequantizes inside the K-loop and is **1.10–1.96x faster
+than BF16** below the roofline crossover. It is a standalone GEMM; connecting it
+to `fused_moe`'s grouped-expert path is the one remaining step between the
+capacity win and a speed win.
 
 - [1. Setup](#1-setup)
 - [2. Memory](#2-memory)

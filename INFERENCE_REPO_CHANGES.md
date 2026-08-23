@@ -27,6 +27,7 @@ Everything below labelled `MEASURED` came from a single NVIDIA A40-24Q
 - [2. API deltas you must track](#2-api-deltas-you-must-track)
 - [3. Evidence for "Should the kernel be built?"](#3-evidence-for-should-the-kernel-be-built)
 - [4. Notes for a low-bit fused kernel](#4-notes-for-a-low-bit-fused-kernel)
+- [4b. The SwiGLU-epilogue conflict, confirmed against sglang](#4b-the-swiglu-epilogue-conflict-confirmed-against-sglang)
 - [5. The numerical-contract method](#5-the-numerical-contract-method)
 - [6. Unrelated changes worth knowing](#6-unrelated-changes-worth-knowing)
 
@@ -286,6 +287,58 @@ Concrete things the §1.1 restructure implies.
    mild, but that is an assumption nobody has measured.
 
 ---
+
+## 4b. The SwiGLU-epilogue conflict, confirmed against sglang
+
+`FROM sglang mainline` — relevant now that `runtime/kernels/w8a16_gemm.py`
+exists and the remaining work is wiring it into the grouped-expert path.
+
+sglang has the identical SiLU-epilogue optimization (`fuse_swiglu_interleaved`,
+`srt/layers/moe/moe_runner/triton_utils/fused_moe.py`), and it **refuses to
+combine it with quantization**:
+
+```python
+assert (
+    activation == "silu" and is_gated
+    and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+    and hidden_states.dtype == torch.bfloat16
+), "fuse_swiglu_interleaved set on an incompatible fused_moe call"
+```
+
+A production engine with mature versions of both features treats them as
+mutually exclusive. Their own comment explains why: the epilogue applies
+`silu(gate) * up` **in-register**, so a standalone activation kernel "would read
+them as halves and be silently wrong."
+
+**What this means here.** `test_llada` now ships that epilogue by default
+(`LLADA_MOE_FUSED_SILU=1`). A W8A16 grouped-expert kernel has to resolve a
+three-way interaction the standalone GEMM never faced:
+
+- the epilogue needs both the gate and up **fp32 accumulators live in-register**
+  at the same time — two B tiles per program, doubling register pressure before
+  any dequant state is added;
+- dequant wants per-group scales applied during the K-loop, which is where the
+  accumulators are being built;
+- `test_llada`'s epilogue is bit-exact by deliberately rounding accumulators to
+  bf16 *first*. A W8A16 path cannot preserve that contract — it is a different
+  numeric by construction — so the acceptance test has to move from Tier B
+  (bit-exactness) to Tier A (token identity against the dequantize-then-matmul
+  reference). See section 5.
+
+**Three options, in increasing order of work:**
+
+1. **Follow sglang** — assert-and-disable. Quantized MoE runs with
+   `LLADA_MOE_FUSED_SILU=0`. Costs the epilogue's measured +1–10%, which is
+   small against a projected 2–3x from the fused dequant. Lowest risk, and it is
+   what a production engine chose.
+2. **Fuse both** — two dequantized B tiles plus two accumulators in-register.
+   Strictly better if the registers are there; nobody appears to have shipped it.
+3. **Quantize GEMM2 only** — GEMM2 has no epilogue partner and carries `w2`,
+   a third of the expert bytes. Captures part of the win with none of the
+   conflict. A useful staging step.
+
+Option 1 is the one to build first, because it makes the W8A16 win measurable
+end-to-end without also debugging a novel register-pressure problem.
 
 ## 5. The numerical-contract method
 

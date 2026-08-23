@@ -29,14 +29,21 @@ here reports a benefit from it.
 | Router top-k capture from the real fused block | IMPLEMENTED |
 | BF16 vs INT4 experiment on the real checkpoint | IMPLEMENTED, **MEASURED** |
 | GSM8K accuracy: BF16 vs INT8 vs INT4, same machine | **MEASURED** (n=200) |
-| **Fused INT8/INT4 Triton MoE kernel** | **FUTURE — does not exist** |
-| Latency or throughput speedup | **NOT CLAIMED, NOT MEASURED** |
+| **Fused W8A16 GEMM** (dequantize inside the K-loop) | IMPLEMENTED, **MEASURED — 1.10–1.96x faster than BF16** |
+| `compile_dequant`: PACKED dequantize fused into one kernel | IMPLEMENTED, MEASURED (bit-identical) |
+| **Fused W8A16 kernel wired into the grouped-expert MoE path** | **FUTURE — the remaining gap** |
+| End-to-end served speedup | **NOT CLAIMED, NOT MEASURED** |
 
-> **There is no speedup here.** Quantized execution is dequantize-then-matmul,
-> which is *slower* than BF16. What exists today is a capacity win and a
-> correctness/measurement layer. See
-> [Should the kernel be built?](#should-the-kernel-be-built) for whether the
-> fast path is even worth writing.
+> **Where speed stands.** The default served path is still
+> dequantize-then-matmul, which is *slower* than BF16 — so the shipped model is
+> a capacity win, not a speed win. But the claim that no faster path exists is
+> no longer true: `runtime/kernels/w8a16_gemm.py` dequantizes inside the GEMM's
+> K-loop, never materialises BF16 in HBM, and measures **1.96x faster than
+> BF16 at M=4, 1.93x at M=16, 1.10x at M=128** (0.78x at M=256, past the
+> roofline crossover). It is a standalone GEMM: **the remaining work is wiring
+> it into `fused_moe`'s grouped-expert path.** Full numbers in
+> [RESULTS.md](RESULTS.md#5-speed); the batch-regime argument for where it pays
+> off is in [Should the kernel be built?](#should-the-kernel-be-built).
 
 ---
 
