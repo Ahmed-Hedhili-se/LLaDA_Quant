@@ -10,11 +10,12 @@ INT4 saves twice as much again for a probable ~6-point accuracy loss. As
 MoE path still dequantizes into HBM before an unchanged BF16 GEMM — so the
 deployed model is a **capacity win, not a speed win**.
 
-That is a property of the wiring, not of quantization. The fused W8A16 GEMM in
-[section 5](#5-speed) dequantizes inside the K-loop and is **1.10–1.96x faster
-than BF16** below the roofline crossover. It is a standalone GEMM; connecting it
-to `fused_moe`'s grouped-expert path is the one remaining step between the
-capacity win and a speed win.
+That is a property of the wiring, not of quantization, and the kernel side of it
+is now closed. `fused_moe_w8a16` ([section 5](#5-speed)) is a grouped-expert MoE
+GEMM that consumes INT8 experts directly and is **1.25–1.95x faster than BF16**
+at the real checkpoint geometry — and ~10x faster than the dequantize-then-matmul
+path it replaces. What remains is wiring it into the served block so the
+end-to-end number can be measured.
 
 - [1. Setup](#1-setup)
 - [2. Memory](#2-memory)
@@ -196,6 +197,57 @@ round trip.
 **Tensor cores are not the issue.** `fused_moe` receives BF16 weights in both
 cases and runs on tensor cores identically. INT4 never reaches a tensor core as
 INT4. The entire gap is dequantization sitting in front of an unchanged GEMM.
+
+### Solved: the grouped-expert W8A16 kernel
+
+`MEASURED` -- A6000, real checkpoint geometry (E=64, top-8, H=2048, EI=1024;
+768 MiB of BF16 experts, past L2), `tests/unit/test_w8a16_moe.py`.
+
+`runtime/kernels/w8a16_moe.py` applies the standalone GEMM's trick to the
+grouped-expert path: same sorting/padding contract as the inference repo's
+`fused_moe_kernel`, reusing its `moe_align_block_size`, but `B` loads as INT8
+and expands in registers. The BF16 expert weight never reaches HBM.
+
+| M | M/expert | BF16 | dequant+GEMM | **fused W8A16** | vs BF16 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.1 | 0.927 ms | 12.094 ms | 0.928 ms | 1.00x |
+| 8 | 1.0 | 1.560 ms | 12.661 ms | **1.249 ms** | **1.25x** |
+| 32 | 4.0 | 1.884 ms | 12.999 ms | **1.252 ms** | **1.50x** |
+| 64 | 8.0 | 1.920 ms | 13.054 ms | **1.286 ms** | **1.49x** |
+| 128 | 16.0 | 2.521 ms | 13.693 ms | **1.341 ms** | **1.88x** |
+| 256 | 32.0 | 2.714 ms | 13.807 ms | **1.395 ms** | **1.95x** |
+| 512 | 64.0 | 2.854 ms | 14.006 ms | **1.735 ms** | **1.64x** |
+| 1024 | 128.0 | 3.321 ms | 14.427 ms | **2.291 ms** | **1.45x** |
+
+Faster than BF16 at every batch except M=1, where the kernel is launch-bound
+rather than weight-bound and there is nothing to win. Against the
+dequantize-then-matmul path it replaces it is **~10x faster** -- that column is
+flat at ~12-14 ms because it is dominated by the dequantize, which does the same
+work regardless of how many tokens consume it.
+
+**Correctness.** Compared against dequantize-then-matmul through the inference
+repo's own `fused_moe`, so the two arms differ in *only* where the dequantize
+happens: relative L2 between 0 and 1.7e-4, cosine 1.0000, at M = 1 to 512.
+Bit-exactness is impossible by construction -- the reference rounds each weight
+to bf16 then accumulates, this kernel scales an int8 in fp32 and rounds once --
+so the assertion is that the difference stays at bf16 rounding level, which it
+does by two orders of magnitude.
+
+**Two things this measurement nearly got wrong.** The first benchmark used the
+correctness tests' small shapes (E=8, H=512, EI=256), where the experts are
+~6 MiB and sit entirely in the A6000's 6 MiB L2. All three arms measured a flat
+~0.9 ms and the kernel looked worthless. The win only exists past L2. Second, a
+dtype-only guard did not reject packed INT4: `pack_int4` stores two 4-bit values
+per byte *in an int8 tensor*, so `dtype == torch.int8` either way, and the kernel
+would have read nibbles as whole values with no error. The guard now checks the
+K-extent, which packing halves.
+
+**Not yet claimed:** an end-to-end served speedup. This is the kernel in
+isolation. Wiring it into `TritonFusedMoEBlock.forward` under
+`ExecutionMode.PACKED`, then re-running GSM8K and the throughput harness, is the
+next step.
+
+---
 
 ### Fixing it: two solutions, measured
 

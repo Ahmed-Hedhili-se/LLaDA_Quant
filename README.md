@@ -31,19 +31,34 @@ here reports a benefit from it.
 | GSM8K accuracy: BF16 vs INT8 vs INT4, same machine | **MEASURED** (n=200) |
 | **Fused W8A16 GEMM** (dequantize inside the K-loop) | IMPLEMENTED, **MEASURED — 1.10–1.96x faster than BF16** |
 | `compile_dequant`: PACKED dequantize fused into one kernel | IMPLEMENTED, MEASURED (bit-identical) |
-| **Fused W8A16 kernel wired into the grouped-expert MoE path** | **FUTURE — the remaining gap** |
+| **Grouped-expert W8A16 MoE kernel** (`fused_moe_w8a16`) | IMPLEMENTED, **MEASURED — 1.25–1.95x faster than BF16** |
 | End-to-end served speedup | **NOT CLAIMED, NOT MEASURED** |
 
-> **Where speed stands.** The default served path is still
-> dequantize-then-matmul, which is *slower* than BF16 — so the shipped model is
-> a capacity win, not a speed win. But the claim that no faster path exists is
-> no longer true: `runtime/kernels/w8a16_gemm.py` dequantizes inside the GEMM's
-> K-loop, never materialises BF16 in HBM, and measures **1.96x faster than
-> BF16 at M=4, 1.93x at M=16, 1.10x at M=128** (0.78x at M=256, past the
-> roofline crossover). It is a standalone GEMM: **the remaining work is wiring
-> it into `fused_moe`'s grouped-expert path.** Full numbers in
-> [RESULTS.md](RESULTS.md#5-speed); the batch-regime argument for where it pays
-> off is in [Should the kernel be built?](#should-the-kernel-be-built).
+> **Where speed stands.** Quantization is no longer only a capacity win.
+> `runtime/kernels/w8a16_moe.py` is a grouped-expert MoE GEMM that consumes INT8
+> experts directly — same sorting/padding contract as the inference repository's
+> `fused_moe_kernel`, reusing its `moe_align_block_size`, but `B` loads as INT8
+> and expands in registers, so the BF16 expert weight never reaches HBM.
+>
+> Measured on an A6000 at the real checkpoint geometry (E=64, top-8, H=2048,
+> EI=1024 — 768 MiB of BF16 experts, past L2):
+>
+> | M/expert | BF16 | dequantize-then-matmul | **fused W8A16** |
+> |---:|---:|---:|---:|
+> | 4 | 1.884 ms | 12.999 ms | **1.252 ms — 1.50x faster** |
+> | 16 | 2.521 ms | 13.693 ms | **1.341 ms — 1.88x faster** |
+> | 32 | 2.714 ms | 13.807 ms | **1.395 ms — 1.95x faster** |
+> | 128 | 3.321 ms | 14.427 ms | **2.291 ms — 1.45x faster** |
+>
+> Faster than BF16 at every batch except M=1 (parity), and **~10x faster than
+> the dequantize-then-matmul path it replaces.** Full table and the correctness
+> contract in [RESULTS.md](RESULTS.md#5-speed).
+>
+> **What is still not claimed:** an end-to-end served number. The kernel is
+> measured in isolation; wiring it into `TritonFusedMoEBlock.forward` behind
+> `ExecutionMode.PACKED`, then re-running GSM8K and the throughput harness, is
+> the next step. Until that is done, the *served* model still pays the
+> dequantize tax.
 
 ---
 
