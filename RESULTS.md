@@ -10,12 +10,10 @@ INT4 saves twice as much again for a probable ~6-point accuracy loss. As
 MoE path still dequantizes into HBM before an unchanged BF16 GEMM — so the
 deployed model is a **capacity win, not a speed win**.
 
-That is a property of the wiring, not of quantization, and the kernel side of it
-is now closed. `fused_moe_w8a16` ([section 5](#5-speed)) is a grouped-expert MoE
-GEMM that consumes INT8 experts directly and is **1.25–1.95x faster than BF16**
-at the real checkpoint geometry — and ~10x faster than the dequantize-then-matmul
-path it replaces. What remains is wiring it into the served block so the
-end-to-end number can be measured.
+That is no longer true with the fused kernel installed. `fused_moe_w8a16` plus
+`runtime/fused_block.py` makes the served model **1.08x faster than BF16 on 0.58x
+the memory** -- quantized and faster at the same time. Numbers in
+[section 5](#5-speed).
 
 - [1. Setup](#1-setup)
 - [2. Memory](#2-memory)
@@ -197,6 +195,44 @@ round trip.
 **Tensor cores are not the issue.** `fused_moe` receives BF16 weights in both
 cases and runs on tensor cores identically. INT4 never reaches a tensor core as
 INT4. The entire gap is dequantization sitting in front of an unchanged GEMM.
+
+### End to end: quantized and faster than BF16
+
+`MEASURED` -- A6000, real checkpoint, `benchmarks/bench_fused_e2e.py`,
+`generate_cached` gen=128 steps=128 block=32, mean of 3 runs after a warmup.
+All three arms in one process, same weights, same prompt, same seed.
+
+| arm | time | tok/s | vs BF16 | resident |
+|---|---:|---:|---:|---:|
+| BF16 | 5.37 s | 23.83 | 1.00x | 14032 MiB |
+| PACKED (dequantize per access) | 29.32 s | 4.37 | 0.18x | 8088 MiB |
+| **PACKED + fused W8A16** | **4.96 s** | **25.82** | **1.08x** | **8088 MiB** |
+
+**This closes the gap the rest of this document describes.** Quantization was a
+capacity win that cost ~6x speed; it is now a capacity win that also gains 8%
+speed. Against the PACKED path it replaces, the fused kernel is **5.9x faster**.
+
+All three arms decode to the same text, and PACKED vs PACKED+fused are
+token-identical -- the fused kernel reproduces the dequantize path's tokens
+exactly on this prompt, despite not being bit-identical in the logits.
+
+Two caveats on the numbers above:
+
+- The `resident` column is `torch.cuda.memory_allocated()` after load, which
+  includes allocator overhead and is not the same metric as
+  [section 2](#2-memory)'s 5008 MiB (that walks live tensors). The ratio here is
+  0.58x against that section's 0.357x; both are real, they measure different
+  things.
+- The BF16 arm runs the inference repo's default fused-SiLU epilogue; the
+  quantized arms do not, because the fused W8A16 kernel deliberately omits it
+  (see section 5). So the 1.08x is *net of* giving up an optimization the BF16
+  arm keeps -- the kernel-level advantage is larger than the end-to-end figure.
+
+**Not measured:** GSM8K under the fused path. Section 4's accuracy numbers came
+through `REFERENCE` mode, which is numerically identical to `PACKED` but not to
+this kernel, so they do not transfer without a re-run.
+
+---
 
 ### Solved: the grouped-expert W8A16 kernel
 

@@ -32,7 +32,8 @@ here reports a benefit from it.
 | **Fused W8A16 GEMM** (dequantize inside the K-loop) | IMPLEMENTED, **MEASURED — 1.10–1.96x faster than BF16** |
 | `compile_dequant`: PACKED dequantize fused into one kernel | IMPLEMENTED, MEASURED (bit-identical) |
 | **Grouped-expert W8A16 MoE kernel** (`fused_moe_w8a16`) | IMPLEMENTED, **MEASURED — 1.25–1.95x faster than BF16** |
-| End-to-end served speedup | **NOT CLAIMED, NOT MEASURED** |
+| Fused kernel wired into `ExecutionMode.PACKED` (`runtime/fused_block.py`) | IMPLEMENTED, MEASURED |
+| **End-to-end generation: quantized AND faster than BF16** | **MEASURED — 1.08x faster, 0.58x memory** |
 
 > **Where speed stands.** Quantization is no longer only a capacity win.
 > `runtime/kernels/w8a16_moe.py` is a grouped-expert MoE GEMM that consumes INT8
@@ -54,11 +55,26 @@ here reports a benefit from it.
 > the dequantize-then-matmul path it replaces.** Full table and the correctness
 > contract in [RESULTS.md](RESULTS.md#5-speed).
 >
-> **What is still not claimed:** an end-to-end served number. The kernel is
-> measured in isolation; wiring it into `TritonFusedMoEBlock.forward` behind
-> `ExecutionMode.PACKED`, then re-running GSM8K and the throughput harness, is
-> the next step. Until that is done, the *served* model still pays the
-> dequantize tax.
+> **End to end on the real checkpoint.** `runtime/fused_block.py` installs a
+> `forward` on PACKED INT8 blocks that hands the packed buffers straight to that
+> kernel, never touching the dequantizing `.w1` property.
+> `benchmarks/bench_fused_e2e.py`, `generate_cached`, 128 tokens, A6000:
+>
+> | arm | time | tok/s | vs BF16 | resident |
+> |---|---:|---:|---:|---:|
+> | BF16 | 5.37 s | 23.83 | 1.00x | 14032 MiB |
+> | PACKED (dequantize per access) | 29.32 s | 4.37 | 0.18x | 8088 MiB |
+> | **PACKED + fused W8A16** | **4.96 s** | **25.82** | **1.08x** | **8088 MiB** |
+>
+> **Quantized and faster than BF16 at the same time** — 1.08x the speed on 0.58x
+> the memory, and 5.9x faster than the PACKED path that shipped before. All three
+> arms produce the same output, and PACKED vs PACKED+fused are token-identical.
+>
+> **What is still not claimed:** GSM8K under the fused path (the accuracy numbers
+> in [section 4](RESULTS.md#4-accuracy) were measured through `REFERENCE` mode,
+> which is numerically identical to PACKED but not to this kernel), a throughput
+> figure under concurrent load, and anything about INT4 — which has no fused path
+> and is left on the dequantize route by design.
 
 ---
 
