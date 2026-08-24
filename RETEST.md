@@ -62,32 +62,46 @@ REFERENCE row flagged `<- LARGER than BF16` (that mode is not a saving).
 ## 3. Numerical error
 
 ```bash
-python benchmarks/bench_numerical.py --heavy-tailed
+python benchmarks/bench_numerical.py                  # Gaussian weights
+python benchmarks/bench_numerical.py --heavy-tailed   # Student-t(3), closer to real weights
 ```
 
-**Expect**, relative weight L2:
+One distribution per invocation. **Expect**, relative weight L2:
 
-| bits | search | Gaussian / Student-t(3) |
-|---|---|---|
-| 8 | amax | 0.0065 / 0.0138 |
-| 4 | amax | 0.1174 / 0.2248 |
-| 4 | mse | **0.1011 / 0.1978** |
+| bits | search | Gaussian | Student-t(3) |
+|---|---|---|---|
+| 8 | amax | 0.0065 | 0.0139 |
+| 8 | mse | 0.0065 (gain 0.0%) | 0.0139 (gain 0.0%) |
+| 4 | amax | 0.1174 | 0.2240 |
+| 4 | mse | **0.1011** | **0.1969** (gain **12.1%**) |
 
-The MSE row must beat the amax row at 4 bits by 12–14%, and by ~0% at 8 bits.
-Storage bytes must be **identical** between the two — the search changes the
-value of the scale, never the format.
+The `gain` column must show 12-14% at 4 bits and ~0% at 8 -- the search is an
+INT4 tool, because 256 levels already absorb an outlier unaided. The `bytes`
+columns must be **identical** between the amax and mse rows: the search
+changes the value of the scale, never the format.
 
 ---
 
 ## 4. MoE regime
 
 ```bash
-python benchmarks/bench_moe_regime.py --machine RTX_A6000
+python benchmarks/bench_moe_regime.py --machine a6000
 ```
 
-**Expect:** M/expert of 4–16 at batch 1, verdict **memory-bound**, and a
-roofline crossover near M=101. (Measured crossover is ~M=170, so the roofline
-is conservative by ~1.7x — see `RESULTS.md` section 8.)
+Machine names are lowercase: `a100`, `a40`, `a40-24q`, `a6000`, `h100`.
+
+**Expect** at batch 1, M/expert of **4.0** (last block) to **16.0** (first
+block), every scheme **memory-bound**, and:
+
+```
+crossover M/expert (bandwidth-bound below this): BF16=202, W8A16=101, W4A16=50
+expert weights BF16 :  12.88 GB   INT8 : 6.44 GB   INT4 : 3.22 GB
+```
+
+W8A16's predicted crossover is M=101; the fused kernel measured ~M=170, so
+the roofline is conservative by ~1.7x. Rows assume perfect routing balance,
+which is **false** on this checkpoint (measured 2.50-6.48x imbalance); pass
+`--routing-file` with real `topk_ids` to replace the assumption.
 
 ---
 
