@@ -195,13 +195,30 @@ python benchmarks/bench_fused_e2e.py --repo $REPO --weight-dir $WEIGHTS \
     --gen-length 128 --steps 128 --block-length 32 --runs 3
 ```
 
-**Expect:** BF16 as the reference, PACKED (dequantize-per-access) ~6x slower,
-PACKED+fused **~1.08x faster than BF16** — quantized and faster at the same
-time, on 0.58x the memory.
+**Expect** (reproduced 2026-08-24):
 
-If the fused arm comes out *slower*, check the weight working set is larger
-than L2 and that L2 is flushed between runs; an 8 MiB tile fits in the A6000's
-cache and produced a false loss once already.
+```
+  arm                             time     tok/s   vs BF16    resident
+  BF16                           5.52s    23.17     1.00x     14032 MiB
+  PACKED (dequant/access)       29.48s     4.34     0.19x      8088 MiB
+  PACKED + fused W8A16           5.01s    25.53     1.10x      8088 MiB
+
+  PACKED vs PACKED+fused produce identical tokens: True
+```
+
+Three things have to hold together, and only together do they mean anything:
+**faster than BF16** (1.10x), **on 0.58x the memory** (8088 vs 14032 MiB),
+**and bit-identical output** to the unfused quantized path. A fused kernel
+that were faster but not identical would be measuring a different model.
+
+`RESULTS.md` records 1.08x; 1.08-1.10x is run-to-run variance, a drop below
+1.0x is not.
+
+If the fused arm comes out *slower*, check the weight working set exceeds L2
+and that L2 is flushed between runs -- an 8 MiB tile fits in the A6000's cache
+and produced a false loss once already.
+
+This arm quantizes at startup on `cuda:0`; it does not read the artifact.
 
 ### Forward and generation latency, INT4 dequantize path
 
