@@ -45,7 +45,6 @@ ART="${ART:-$HOME/llada-moe-int8-g128}"
 PORT="${PORT:-8000}"
 LIMIT="${LIMIT:-200}"
 SEED="${SEED:-42}"
-OUT="${OUT:-$HOME/gsm8k-results/n$LIMIT}"
 # FORCE=1 re-grades even when a matching result exists. Without it, a repeat
 # run of a finished comparison completes in seconds and only reprints -- which
 # looks indistinguishable from a hang if you are watching with plain "tail -f".
@@ -73,10 +72,16 @@ FUSED="${FUSED:-0}"
 if [ "$FUSED" = "1" ]; then
     MODE="packed"
     QUANT_EXTRA="--fused"
-    OUT="${OUT:-$HOME/gsm8k-results/n$LIMIT-fused}"
+    SUFFIX="-fused"
 else
     QUANT_EXTRA=""
+    SUFFIX=""
 fi
+
+# Derived AFTER the FUSED block, not before it. Setting the default earlier made
+# the "${OUT:-...}" here a no-op, so a FUSED=1 run silently reused the REFERENCE
+# results and reported them as fused numbers.
+OUT="${OUT:-$HOME/gsm8k-results/n$LIMIT$SUFFIX}"
 
 mkdir -p "$OUT"
 # shellcheck disable=SC1091
@@ -148,6 +153,14 @@ run_arm() {
     label=$(curl -s "http://localhost:$PORT/v1/quantization" \
             | python -c 'import json,sys; print(json.load(sys.stdin)["label"])')
     printf '   serving: %s\n' "$label"
+    # Prove the fused kernel is actually installed. Without this a FUSED=1
+    # run that fell back would grade the dequantize path under a fused name.
+    if [ "$arm" = "quant" ] && [ "$FUSED" = "1" ]; then
+        case "$label" in
+            *fused*) : ;;
+            *) fail "FUSED=1 but the server reports '$label' -- not the fused kernel" ;;
+        esac
+    fi
     echo "$label" > "$OUT/label-$arm.txt"
 
     log "$arm: grading GSM8K (limit=$LIMIT) -- this takes ~25 min at n=200"
