@@ -64,6 +64,12 @@ def main() -> None:
                         help="reference: same numerics at BF16 speed, ~1.5x memory "
                              "(use for accuracy). packed: real memory reduction, "
                              "~7x slower per forward (use for memory)")
+    parser.add_argument("--fused", action="store_true",
+                        help="route PACKED INT8 expert blocks through the fused "
+                             "W8A16 kernel instead of dequantizing on every weight "
+                             "access. Needs --execution-mode packed --bits 8: that "
+                             "is the only combination with a fused path, and the "
+                             "only one faster than BF16 rather than ~6x slower.")
     parser.add_argument("--quantize-device", default=None,
                         help="where to run the scale search (default: the model's device)")
     args = parser.parse_args()
@@ -127,15 +133,41 @@ def main() -> None:
         print(result.summary())
         print(f"resident: {before.total / 2**30:.2f} GiB -> {after.total / 2**30:.2f} GiB "
               f"({after.total / before.total:.3f}x)")
+        if config.mode.value == "reference" and args.fused:
+            raise SystemExit(
+                "--fused needs --execution-mode packed. REFERENCE keeps a "
+                "dequantized BF16 copy resident and exists for accuracy runs; "
+                "fusing there would measure neither the memory win nor the "
+                "speed win."
+            )
         if config.mode.value == "reference":
             print("REFERENCE mode: identical numerics to packed, at BF16 speed, "
                   "using more memory. Correct choice for accuracy evaluation.\n")
+        fused_blocks = []
+        if args.fused:
+            from LLaDA_Quant.runtime import fused_block
+
+            # strict: a --fused run that quietly fell back to the dequantize
+            # path would still serve, and its throughput would be written up as
+            # a fused number. Fail instead.
+            fused_blocks = fused_block.install(server.MODEL, strict=True)
+
+        if config.mode.value == "reference":
+            pass  # message already printed above
+        elif fused_blocks:
+            print(f"PACKED + fused W8A16: {len(fused_blocks)} expert blocks consume "
+                  "packed INT8 directly. Real memory reduction AND faster than "
+                  "BF16 (1.08x end to end, measured).\n")
         else:
-            print("PACKED mode: real memory reduction, ~7x slower per forward.\n")
+            print("PACKED mode: real memory reduction, ~7x slower per forward. "
+                  "Add --fused to remove the dequantize round trip.\n")
         served = {
             "quantized": True,
+            "fused_kernel": bool(fused_blocks),
+            "fused_blocks": len(fused_blocks),
             "label": (f"INT{args.bits} g{args.group_size} {args.scale_search} "
-                      f"{args.execution_mode}"),
+                      f"{args.execution_mode}"
+                      + (" +fused-W8A16" if fused_blocks else "")),
             "config": config.to_dict(),
             "expert_blocks": len(result.expert_blocks),
             "resident_bytes": after.total,
