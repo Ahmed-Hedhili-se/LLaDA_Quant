@@ -13,6 +13,14 @@ export ART=~/llada-moe-int8-g128        # the pre-quantized artifact
 cd ~/LLaDA_Quant && source ~/venv/bin/activate
 ```
 
+**Run that block first, in every new shell.** Without the venv there is no
+`python` on this box (only `python3`, which lacks torch), and without the
+exports `--repo $REPO` expands to `--repo --weight-dir`. Confirm with:
+
+```bash
+which python && python -c "import torch; print(torch.__version__)" && echo "$REPO"
+```
+
 Sections 1–4 need no GPU and no weights. Sections 5–9 need both.
 
 - [1. Unit tests](#1-unit-tests)
@@ -238,42 +246,65 @@ number that section 7's fused arm is compared against.
 
 ## 8. Correctness — GSM8K
 
-Two arms, **each needing its own server restart**. Forgetting to restart once
-produced two byte-identical result files that looked like a clean "quantization
-changed nothing" finding — hence the `/v1/quantization` check below.
+### Use the script
+
+```bash
+bash tools/run_gsm8k_comparison.sh              # n=200, ~50 min total
+LIMIT=8 bash tools/run_gsm8k_comparison.sh      # smoke run first, ~4 min
+```
+
+It activates the venv itself, so it works from a bare login shell and does
+not depend on the `export` block at the top of this file. Everything is
+overridable: `REPO`, `WEIGHTS`, `ART`, `PORT`, `LIMIT`, `SEED`, `MODE`, `OUT`.
+
+The script exists because the manual version below **cannot be pasted as a
+block** — each server runs in the foreground and never returns — and because
+it enforces the check that matters: it reads `/v1/quantization` on each arm
+and aborts if both report the same label. Two arms serving the same model
+produce a meaningless delta, which already happened once and was caught only
+because the outputs were byte-identical.
+
+### Or by hand, one command per shell
+
+Three steps per arm, and the server must be **stopped between arms**. Run
+the server in one shell and the grader in another, or background the server.
 
 Use `--execution-mode reference` for accuracy: numerically identical to
 `packed` (a test asserts the reconstructed weights are `torch.equal`) but at
-BF16 speed, which turns an hour into ~25 minutes. It costs 1.452x memory, which
-48 GB absorbs.
-
-### Arm 1 — BF16 baseline
+BF16 speed, which turns an hour into ~25 minutes. It costs 1.452x memory,
+which 48 GB absorbs. Never report REFERENCE as a memory saving.
 
 ```bash
+# shell 1 -- arm 1, BF16 baseline. Leave it running.
+cd ~/LLaDA_Quant && source ~/venv/bin/activate
 python benchmarks/serve_quantized.py --repo $REPO --weight-dir $WEIGHTS \
     --no-quantize --port 8000
 ```
 
-### Arm 2 — INT8
-
 ```bash
-python benchmarks/serve_quantized.py --repo $REPO --weight-dir $WEIGHTS \
-    --quantized-checkpoint $ART --execution-mode reference --port 8000
-```
-
-### Verify which model is actually up, then grade
-
-```bash
-curl -s http://localhost:8000/v1/quantization | python3 -c \
-  'import json,sys; d=json.load(sys.stdin); print(d["label"])'
+# shell 2 -- confirm what is serving, then grade
+cd ~/LLaDA_Quant && source ~/venv/bin/activate
+curl -s http://localhost:8000/v1/quantization | python -c \
+  'import json,sys; print(json.load(sys.stdin)["label"])'
 
 cd $REPO && python eval/correctness/run_math_reasoning_code.py \
     --task gsm8k --base-url http://localhost:8000 \
     --limit 200 --seed 42 \
     --max-tokens 1024 --steps 512 --block-length 64 \
     --confidence-threshold 0.9 \
-    --output results/gsm8k-bf16.json      # rename per arm
+    --output ~/gsm8k-results/gsm8k-bf16.json
 ```
+
+Then stop the server (`Ctrl-C`, or `pkill -f "[s]erve_quantized"`), start arm 2, and
+repeat with a different `--output`:
+
+```bash
+python benchmarks/serve_quantized.py --repo $REPO --weight-dir $WEIGHTS \
+    --quantized-checkpoint $ART --execution-mode reference --port 8000
+```
+
+**Check the label changes between arms.** If both print the same thing, the
+server was never restarted and the two result files describe one model.
 
 **Expect:** BF16 **75.5%** (151/200), INT8 **73.5%** (147/200), −2.0 pt,
 McNemar **p = 0.585** — not distinguishable from chance. INT4-MSE lands near
