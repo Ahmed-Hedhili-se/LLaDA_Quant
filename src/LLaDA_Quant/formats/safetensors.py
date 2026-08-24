@@ -19,6 +19,7 @@ from __future__ import annotations
 import glob
 import os
 from dataclasses import replace
+from itertools import chain
 from typing import List, Optional, Set, Tuple
 
 import torch
@@ -114,13 +115,28 @@ def _read_json(directory: str, filename: str) -> dict:
         return json.load(f)
 
 
+def _first_device(module: nn.Module, recurse: bool, default: torch.device) -> torch.device:
+    for tensor in chain(module.parameters(recurse), module.buffers(recurse)):
+        return tensor.device
+    return default
+
+
 def _register_missing_buffers(model: nn.Module, state: dict[str, torch.Tensor]) -> List[str]:
     """Add persistent buffers found in ``state`` but absent from ``model``.
 
     Needed so a plain (unquantized) model can absorb a quantized checkpoint
     that adds packed expert buffers (``_qw1``, ``_sw1``, ...).
+
+    Each buffer lands on the device its parent module already lives on.
+    safetensors reads to CPU, and registering the tensor as-is left the packed
+    integers on the host while the rest of a CUDA model stayed on the device:
+    dequantization still worked (it moves data), so memory accounting and
+    accuracy looked right, but the fused kernel was handed host pointers and
+    failed with "Pointer argument cannot be accessed from Triton (cpu
+    tensor?)". A silent device split is worth preventing at the source.
     """
     existing = set(model.state_dict().keys())
+    fallback = _first_device(model, True, torch.device("cpu"))
     registered: List[str] = []
     for name, tensor in state.items():
         if name in existing:
@@ -134,7 +150,8 @@ def _register_missing_buffers(model: nn.Module, state: dict[str, torch.Tensor]) 
                 f"submodule {parent_path!r} ({exc}). The checkpoint was produced from a "
                 "different architecture."
             ) from exc
-        module.register_buffer(leaf, tensor.clone(), persistent=True)
+        device = _first_device(module, False, fallback)
+        module.register_buffer(leaf, tensor.to(device), persistent=True)
         registered.append(name)
     return registered
 

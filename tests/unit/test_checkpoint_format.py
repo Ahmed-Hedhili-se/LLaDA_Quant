@@ -185,6 +185,46 @@ def test_strict_load_still_catches_a_real_mismatch(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Loaded buffers must land where the model already lives
+#
+# safetensors reads to CPU. Registering those tensors as-is left the packed
+# integers on the host inside a CUDA model: dequantization still worked, so
+# memory and accuracy looked correct, and only the fused Triton kernel noticed
+# -- at request time, with "Pointer argument cannot be accessed from Triton".
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_loading_into_a_cuda_model_keeps_every_buffer_on_the_device(tmp_path):
+    torch.manual_seed(0)
+    model = TinyMoEModel()
+    _save(model, QuantConfig(bits=8, group_size=64, targets=("expert",)), str(tmp_path))
+
+    fresh = TinyMoEModel(seed=4).cuda()
+    load_quantized_weights(fresh, str(tmp_path))
+
+    on_host = [
+        name for name, tensor in fresh.state_dict().items() if tensor.device.type != "cuda"
+    ]
+    assert not on_host, f"loaded onto the host inside a CUDA model: {on_host}"
+    assert fresh.layers[0].mlp.w1.device.type == "cuda", "reconstructed weight is not on the GPU"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_a_cuda_load_is_numerically_the_same_as_a_cpu_load(tmp_path):
+    torch.manual_seed(0)
+    model = TinyMoEModel()
+    _save(model, QuantConfig(bits=4, group_size=64, targets=("expert",)), str(tmp_path))
+
+    on_cpu = TinyMoEModel(seed=8)
+    load_quantized_weights(on_cpu, str(tmp_path))
+    on_gpu = TinyMoEModel(seed=8).cuda()
+    load_quantized_weights(on_gpu, str(tmp_path))
+
+    assert torch.equal(on_gpu.layers[0].mlp.w1.cpu(), on_cpu.layers[0].mlp.w1)
+
+
+# --------------------------------------------------------------------------
 # Residency is a property of the run, not of the file
 #
 # tools/quantize_checkpoint.py writes one artifact and both the deployment run
