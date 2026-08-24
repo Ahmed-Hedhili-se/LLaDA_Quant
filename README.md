@@ -864,11 +864,28 @@ cosine similarity on logits, and Mode B already produces exactly the artifact
 it needs: run `capture_free_running(reference_path_model, kernel_model, ...)`
 and require `final_token_agreement == 1.0`.
 
-Gate on the real task as well. GSM8K n=50 seed=42 scored 88.0% before and
-after that change; that is the acceptance bar an accuracy-affecting change
-should clear. Treat it as a *comparison* baseline rather than an absolute —
-3 of the 44 correct answers rest on a last-number-in-the-response grading
-fallback.
+**That gate turned out to be unachievable, and measuring it was worth more than
+passing it.** The fused W8A16 kernel and the dequantize path hold bit-identical
+weights, and they disagree on **23.0%** of GSM8K answers — more than either
+disagrees with BF16. The kernel is not wrong: it scores the same (73.5% vs
+74.5%, p = 0.883 between them) and is *closer* to fp32 ground truth than cuBLAS
+on the same inputs. The router is simply near-uniform enough (top-1 weight
+~1.7–5%) that changing fp32 accumulation order inside the GEMM flips top-8
+membership on a quarter of positions.
+
+So on this checkpoint, token-identity is the wrong acceptance bar for a kernel
+change — nothing that touches accumulation order can pass it. Use a paired
+accuracy comparison instead (`tools/run_gsm8k_comparison.sh`), and treat churn
+as a reported quantity rather than a failure. The bar that *is* meaningful:
+scores statistically indistinguishable, and the packed buffers provably driving
+the computation (`test_fused_block.py` zeroes `_qw1` and requires the output to
+move).
+
+Gate on the real task as well, but with a same-machine baseline. The inference
+repo records 88.0% at n=50 on an A40-24Q; this hardware's BF16 baseline is
+**75.5% at n=200**, and only a same-machine BF16-vs-quantized delta is
+interpretable. Note also that 3 of the 44 correct answers in their n=50 run
+rest on a last-number-in-the-response grading fallback.
 
 ### Getting routing out of the real block
 
