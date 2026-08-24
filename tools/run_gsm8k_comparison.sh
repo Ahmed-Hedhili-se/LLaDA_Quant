@@ -83,6 +83,18 @@ fi
 # results and reported them as fused numbers.
 OUT="${OUT:-$HOME/gsm8k-results/n$LIMIT$SUFFIX}"
 
+# Only one run at a time. stop_server kills *any* serve_quantized, so a second
+# concurrent run kills the first one's server mid-grading -- which is exactly
+# how the 18%-with-149-errors result above got written.
+LOCK="${LOCK:-$HOME/.llada-gsm8k.lock}"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "another run holds $LOCK." >&2
+    echo "If nothing is running (check: pgrep -af '[r]un_gsm8k_comparison')," >&2
+    echo "remove it with: rmdir $LOCK" >&2
+    exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+
 mkdir -p "$OUT"
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
@@ -129,8 +141,16 @@ run_arm() {
     # expensive failure. A result is only reused if it graded the same number
     # of questions, so a leftover smoke run never stands in for a real one.
     if [ -f "$result" ] && [ "$FORCE" != "1" ]; then
-        local done_n
+        local done_n errs
+        # 'total' alone is not enough. A grader whose server died mid-run still
+        # writes total=200 -- with 149 of them recorded as errors and accuracy
+        # 18%. That happened, and resume would have reused it as a real result.
         done_n=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['total'])"                  "$result" 2>/dev/null || echo 0)
+        errs=$(python -c "import json,sys; print(json.load(open(sys.argv[1])).get('errors', 0))"                "$result" 2>/dev/null || echo 999)
+        if [ "$errs" != "0" ]; then
+            log "$arm: discarding $result -- it recorded $errs request error(s)"
+            done_n="-1"
+        fi
         if [ "$done_n" = "$LIMIT" ]; then
             log "$arm: reusing $result ($done_n questions already graded)"
             echo "   nothing to run. FORCE=1 re-grades from scratch."
