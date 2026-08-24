@@ -75,7 +75,7 @@ trajectory  (depends only on validation.metrics)
 | **G. Trajectory** | `trajectory/` | What quantization does to diffusion generation | validation.metrics |
 | **H. Benchmarks** | `benchmarks/` | Runnable, category-labelled measurement scripts | A, F |
 | **I. Tests** | `tests/unit/` | 244 tests, several of them regression guards for real past bugs | all |
-| **J. Tools** | `tools/` | Non-measurement executables — currently offline quantization | A, E |
+| **J. Tools** | `tools/` | Non-measurement executables: offline quantization, verification, eval drivers | A, E |
 
 ---
 
@@ -707,6 +707,25 @@ that once produced two identical GSM8K result files from one unchanged server.
 BF16 weight read still happens — model construction belongs to the inference
 repository, which this project does not modify, so the artifact saves the
 scale search and nothing else.
+
+### `tools/check_determinism.py`
+
+Rebuilds the model in a fresh process, requantizes from the artifact's own
+manifest, and compares tensor by tensor. Exists because the claim it checks —
+that the scale search is deterministic, so an artifact equals a startup-time
+quantization — fails **silently** when false: different scales still load,
+still run, and still produce plausible text.
+
+### `tools/run_gsm8k_comparison.sh`
+
+Both GSM8K arms in one command: starts each server, waits for `/health`,
+records what `/v1/quantization` reports, grades, stops the server.
+
+Two guards, both from real failures. It **aborts if the two arms report the
+same label** — forgetting the restart once produced two byte-identical result
+files that read as a clean "quantization changed nothing" finding. And below
+n=100 it refuses to print the interpretation, because a smoke run at n=8 shows
+a 12.5-point delta per question and that reads like a result.
 
 ### `src/LLaDA_Quant/llada_repo.py`
 
