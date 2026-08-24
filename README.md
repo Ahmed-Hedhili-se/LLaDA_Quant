@@ -33,7 +33,11 @@ here reports a benefit from it.
 | `compile_dequant`: PACKED dequantize fused into one kernel | IMPLEMENTED, MEASURED (bit-identical) |
 | **Grouped-expert W8A16 MoE kernel** (`fused_moe_w8a16`) | IMPLEMENTED, **MEASURED — 1.25–1.95x faster than BF16** |
 | Fused kernel wired into `ExecutionMode.PACKED` (`runtime/fused_block.py`) | IMPLEMENTED, MEASURED |
-| **End-to-end generation: quantized AND faster than BF16** | **MEASURED — 1.08x faster, 0.58x memory** |
+| **End-to-end generation: quantized AND faster than BF16** | **MEASURED — 1.11x faster, 0.58x memory (batch 1)** |
+| **Offline quantization to a reusable artifact** (`tools/quantize_checkpoint.py`) | IMPLEMENTED, **MEASURED — bit-identical to a startup quantization** |
+| Served throughput over HTTP, all arms | **MEASURED** |
+| **Batched throughput (their `BATCH_MAX_SIZE=32` config)** | **MEASURED — 0.99x: the speed win does not survive batching** |
+| GSM8K under the **fused kernel** specifically | **MEASURED — 73.5% vs BF16 75.5%, p = 0.627** |
 
 > **Where speed stands.** Quantization is no longer only a capacity win.
 > `runtime/kernels/w8a16_moe.py` is a grouped-expert MoE GEMM that consumes INT8
@@ -57,26 +61,61 @@ here reports a benefit from it.
 >
 > **End to end on the real checkpoint.** `runtime/fused_block.py` installs a
 > `forward` on PACKED INT8 blocks that hands the packed buffers straight to that
-> kernel, never touching the dequantizing `.w1` property.
-> `benchmarks/bench_fused_e2e.py`, `generate_cached`, 128 tokens, A6000:
+> kernel, never touching the dequantizing `.w1` property. Served over HTTP from a
+> pre-quantized artifact, A6000:
 >
-> | arm | time | tok/s | vs BF16 | resident |
+> | arm | s/request | vs BF16 | resident |
+> |---|---:|---:|---:|
+> | BF16 | 11.88 s | 1.00x | 13.70 GiB |
+> | PACKED (dequantize per access) | 60.57 s | 0.20x | 7.89 GiB |
+> | **PACKED + fused W8A16** | **10.71 s** | **1.11x** | **7.89 GiB** |
+>
+> **Quantized and faster than BF16 at the same time** — at batch 1.
+>
+> **But the speed win does not survive batching.** Their headline throughput
+> config (`BATCH_MAX_SIZE=32`, concurrency 32, their own harness) on the same
+> box:
+>
+> | arm | wall | output tokens | tok/s | resident |
 > |---|---:|---:|---:|---:|
-> | BF16 | 5.37 s | 23.83 | 1.00x | 14032 MiB |
-> | PACKED (dequantize per access) | 29.32 s | 4.37 | 0.18x | 8088 MiB |
-> | **PACKED + fused W8A16** | **4.96 s** | **25.82** | **1.08x** | **8088 MiB** |
+> | BF16 | 35.3 s | 8128 | 230.5 | 13.70 GiB |
+> | PACKED + fused W8A16 | 35.7 s | 8128 | **227.6 — 0.99x** | **7.89 GiB** |
 >
-> **Quantized and faster than BF16 at the same time** — 1.08x the speed on 0.58x
-> the memory, and 5.9x faster than the PACKED path that shipped before. All three
-> arms produce the same output, and PACKED vs PACKED+fused are token-identical.
+> That is the roofline landing, not a regression: W8A16's crossover is
+> M/expert = 101, batch 1 sits at 4-16 and batch 32 at 512. Below the crossover
+> the GEMM waits on weight bytes and halving them helps; above it the GEMM waits
+> on FLOPs, which weight-only quantization does not reduce.
 >
-> **What is still not claimed:** GSM8K under the fused path (the accuracy numbers
-> in [section 4](RESULTS.md#4-accuracy) were measured through `REFERENCE` mode,
-> which is numerically identical to PACKED but not to this kernel), a throughput
-> figure under concurrent load, and anything about INT4 — which has no fused path
-> and is left on the dequantize route by design.
+> | serving mode | speed | memory |
+> |---|---|---|
+> | single request / low concurrency | **1.11x faster** | **0.58x** |
+> | batched | **unchanged** | **0.58x** |
+>
+> Quantization is never a loss once the kernel is wired. What it is not, when
+> batched, is a speed win.
+>
+> **Accuracy under the fused kernel, measured separately** — it is a different
+> computation from REFERENCE/PACKED (fp32 accumulation inside the K-loop vs a
+> bf16 GEMM on pre-dequantized weights), so it does not inherit their numbers:
+>
+> | config | GSM8K n=200 | vs BF16 | McNemar |
+> |---|---|---|---|
+> | BF16 | 75.5% (151/200) | — | — |
+> | INT8 REFERENCE / PACKED | 74.5% (149/200) | −1.0 pt | p = 0.868 |
+> | **INT8 PACKED + fused** | **73.5%** (147/200) | −2.0 pt | **p = 0.627** |
+>
+> **The two quantized paths disagree with each other more than with BF16** —
+> 23.0% of answers differ between REFERENCE and fused, against 18-19% versus
+> BF16, despite bit-identical weights. Only the accumulation precision differs.
+> On a checkpoint whose router is near-uniform that is enough to flip a quarter
+> of the answers while leaving the score unchanged, so per-response
+> reproducibility is a property of the kernel, not of the weights.
+>
+> **What is still not claimed:** anything about INT4 under a fused kernel — it
+> has none, and is left on the dequantize route by design.
 
 ---
+
 
 ## Table of contents
 
@@ -107,7 +146,7 @@ here reports a benefit from it.
                             │                   │
                             └── scales ─────────┘                    ┌──► INT8 Triton
                                                                      │    fused MoE
-                                            future kernel consumes ──┤    (FUTURE)
+                                            fused kernel consumes ───┤    (BUILT)
                                             packed weights directly  └──► INT4 Triton
                                                                           fused MoE
                                                                           (FUTURE)
@@ -245,21 +284,44 @@ weight-only kernel and belongs in the regime analysis.
 
 ### GSM8K accuracy
 
-`MEASURED` — RTX A6000, LLaDA-MoE-7B-A1B-Instruct, n=50 seed=42,
+`MEASURED` — RTX A6000, LLaDA-MoE-7B-A1B-Instruct, n=200 seed=42,
 `max_tokens=1024 steps=512 block_length=64 confidence_threshold=0.9` (the
-inference repo's recommended config), INT4 group 128 with MSE scale search in
-REFERENCE mode. Both arms served through the same launcher, differing only in
-quantization.
+inference repo's recommended config), group 128 with MSE scale search. Every
+arm was served through the same launcher, differing only in quantization, and
+each was verified over HTTP via `/v1/quantization` before grading.
+
+Reproduce with `bash tools/run_gsm8k_comparison.sh` (add `FUSED=1` for the
+kernel arm).
 
 | config | GSM8K n=200 | vs BF16 | weight rel. L2 | expert bytes | item churn |
 |---|---|---|---|---|---|
 | BF16 | **75.5%** (151/200) | — | — | 12288 MiB | — |
-| INT8 g128 | **73.5%** (147/200) | **-2.0 pt** (p=0.585) | 0.0065 | 6336 MiB | 15% |
+| INT8 g128 REFERENCE (run 1) | **73.5%** (147/200) | **-2.0 pt** (p=0.585) | 0.0065 | 6336 MiB | 15% |
+| INT8 g128 REFERENCE (run 2) | **74.5%** (149/200) | **-1.0 pt** (p=0.868) | 0.0065 | 6336 MiB | 18% |
+| **INT8 g128 PACKED + fused** | **73.5%** (147/200) | **-2.0 pt** (p=0.627) | 0.0065 | 6336 MiB | 19% |
 | INT4-MSE g128 | **69.5%** (139/200) | **-6.0 pt** (p=0.179) | 0.1011 | 3264 MiB | 22% |
 
-**INT8 is the deployable configuration.** Half the expert bytes at a 2-point
-cost that a paired McNemar cannot distinguish from chance (13 items fixed, 17
-broken, p=0.585).
+**INT8 is the deployable configuration**, including under the fused kernel.
+Three INT8 runs have landed at 147, 149, 147 correct against BF16's 151, with
+p between 0.585 and 0.868 — nothing distinguishable from chance.
+
+**The fused kernel was graded separately, not assumed.** It is a different
+computation from REFERENCE/PACKED: fp32 accumulation inside the GEMM's K-loop
+versus a bf16 GEMM on pre-dequantized weights. Same weights, different
+arithmetic, so it does not inherit their accuracy.
+
+**Two runs of the same model differ by 2 questions**, which is the honest noise
+floor on this measurement — about the size of the effect being measured. The
+BF16 arm, by contrast, reproduced *item-for-item* across both runs, all 200
+questions, which is what makes the INT8 arms comparable at all.
+
+**Reproducibility is a property of the kernel, not the weights.** REFERENCE and
+fused hold bit-identical weights and disagree on **23.0%** of answers — more
+than either disagrees with BF16 (18-19%). The router's top-1 weight is ~1.7-5%,
+so top-8 membership flips under any bf16-level perturbation, and changing the
+accumulation order is one. Both score the same; a quarter of the individual
+answers change. Plan for that if per-response stability matters across a kernel
+upgrade.
 
 **The loss tracks weight precision, not a routing threshold.** That was the
 open question: if INT4's -6 points came from the near-uniform router flipping
@@ -865,9 +927,10 @@ Three categories, each stating what it measures and what it does not.
 | `bench_storage.py` | A — storage | resident tensor bytes, checkpoint bytes | any latency |
 | `bench_numerical.py` | B — numerical | weight and output quantization error | latency — both paths run the same BF16 matmul |
 | `bench_moe_regime.py` | decision | tokens/expert, GEMM shapes, roofline side | wall-clock anything |
-| `bench_bf16_vs_int4.py` | validation | BF16 vs INT4-MSE on the **real** checkpoint: router overlap, token commits, final output, against a BF16-vs-BF16 floor | latency; needs a GPU, never yet run |
+| `bench_bf16_vs_int4.py` | validation | BF16 vs INT4-MSE on the **real** checkpoint: router overlap, token commits, final output, against a BF16-vs-BF16 floor | latency; needs a GPU |
 | `bench_generation_latency.py` | C' — cost | wall clock of dequantize-then-matmul INT4 vs BF16, forward and full generation | a fused kernel; INT4 is expected to be **slower** |
-| *(none yet)* | C — kernel | BF16 vs INT8 vs INT4 fused MoE | **the kernel does not exist** |
+| `bench_fused_e2e.py` | C — kernel | BF16 vs PACKED vs PACKED+fused, `generate_cached`, in-process | serving overhead; batch 1 only |
+| `bench_served_throughput.py` | D — end to end | throughput of a *running* server over HTTP, tokens/s from the server's own timing | does not start a server; point it at one |
 | *(none yet)* | D — end to end | tokens/s, latency, memory, batch, steps | needs the inference repo and a GPU |
 
 `tools/` holds the non-measurement executables:
@@ -1004,18 +1067,24 @@ device-placement tests run there and are skipped on a CPU-only box.
 1. **v0.2 (current)** — packed INT8/INT4, honest memory modes, self-contained
    checkpoints, safe targeting, split benchmarks, trajectory trace/replay,
    MoE regime analysis.
-2. **v0.3** — *(trajectory, noise floor and routing statistics on the real
-   checkpoint are now measured; see [On the real checkpoint](#on-the-real-checkpoint))*.
-   What remains is the verdict that matters: GSM8K n=50 seed=42 against the
-   inference repo's 88.0% baseline. One prompt reaching the right answer is not
-   an accuracy result. This is also what decides whether INT4 is usable at all: scale
-   search narrows the gap, sensitivity-driven mixed precision (INT4 where a
-   layer tolerates it, INT8 where it does not) is the likely next step, and a
-   data-aware method (GPTQ/AWQ) is the fallback if neither suffices.
-3. **v0.4** — *conditional on v0.3 evidence*: a fused Triton MoE kernel
-   consuming packed weights. Build the W8A16/W4A16 path only if the target is
-   small-batch latency; the large-batch regime needs a capacity-to-throughput
-   measurement instead.
+2. **v0.3 — done.** GSM8K n=200 on the real checkpoint for BF16, INT8
+   (REFERENCE and fused) and INT4-MSE, replicated; trajectory, noise floor and
+   routing statistics measured; the fused W8A16 MoE kernel built, wired into
+   PACKED, and graded; offline artifacts with a bit-identity check.
+3. **v0.4 — what the evidence now points at.** The roadmap said to build the
+   fused kernel "only if the target is small-batch latency". That turned out to
+   be exactly right: 1.11x at batch 1, **0.99x batched**. So the remaining work
+   is not more kernel:
+   - **INT4 is the open accuracy question.** −6.0 pt at n=200, p = 0.179 —
+     stable across sample sizes and still not established. Settling it needs
+     ~864 questions per arm. Sensitivity-driven mixed precision is the likely
+     fix; AWQ/GPTQ the fallback. `algorithms/calibration.py` and
+     `algorithms/outliers.py` document why neither is built yet.
+   - **INT4 has no fused path.** It needs an unpack inside the K-loop;
+     `fused_block.install` leaves INT4 blocks on the dequantize route rather
+     than serving them wrong.
+   - **Per-response reproducibility across kernels** is unaddressed: two
+     bit-identical-weight paths disagree on 23% of answers.
 4. **v1.0** — reproducible end-to-end evaluation, frozen checkpoint format.
 
 ---
