@@ -157,6 +157,19 @@ print(f"  BF16       {pa:6.2f}%  ({a['correct']}/{a['total']})")
 print(f"  quantized  {pb:6.2f}%  ({b['correct']}/{b['total']})")
 print(f"  delta      {pb - pa:+6.2f} pt")
 print()
+
+# A small run is a plumbing check, not a measurement. n=8 moves 12.5 points
+# per question, and INT4 already demonstrated the trap: 64.0% at n=50 and
+# 69.5% at n=200 on a superset of the same questions.
+if a['total'] < 100:
+    step = 100 / a['total']
+    print(f"  *** n={a['total']} is a SMOKE RUN, not a result.")
+    print(f"      One question is worth {step:.1f} points here, so this delta")
+    print("      says nothing about accuracy -- it says the harness runs.")
+    print("      Resolving a 2-point gap needs the full 1319-item set;")
+    print("      a 6-point gap needs roughly 864 questions per arm.")
+    raise SystemExit(0)
+print()
 print("  Expected at n=200: BF16 75.5%, INT8 73.5% -- a -2.0 pt gap that",
       "McNemar puts at p = 0.585,")
 print("  i.e. not distinguishable from chance. RESULTS.md section 4.")
