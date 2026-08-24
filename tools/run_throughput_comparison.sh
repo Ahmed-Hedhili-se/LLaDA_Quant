@@ -133,18 +133,27 @@ if not rows:
     raise SystemExit("no results to summarise")
 
 base = next((d["aggregate_tok_s"] for a, d in rows if a == "bf16"), None)
+base_wall = next((d["mean_wall_s"] for a, d in rows if a == "bf16"), None)
 
-print(f"  {'arm':8} {'tok/s':>9} {'vs BF16':>9}   label")
-print("  " + "-" * 68)
+# Seconds per request is the honest metric for a diffusion LM. The model runs
+# a fixed number of denoising steps whatever the answer turns out to be, so
+# request latency is flat and tok/s mostly measures how long the answer
+# happened to be -- 3 tokens reads as 0.26 tok/s and 204 tokens as 16.9 tok/s
+# from the same 12 s of compute. tok/s is kept because it is what everyone
+# asks for, but the ratio to compare arms on is the latency one.
+print(f"  {'arm':8} {'s/request':>10} {'vs BF16':>9} {'tok/s':>9}   label")
+print("  " + "-" * 76)
 for arm, d in rows:
-    rate = d["aggregate_tok_s"]
-    ratio = f"{rate / base:.2f}x" if base else "--"
-    print(f"  {arm:8} {rate:9.2f} {ratio:>9}   {d['label']}")
+    wall = d['mean_wall_s']
+    speedup = f"{base_wall / wall:.2f}x" if base_wall and wall else "--"
+    print(f"  {arm:8} {wall:10.2f} {speedup:>9} {d['aggregate_tok_s']:9.2f}"
+          f"   {d['label']}")
 
 print()
-print("  Measured over HTTP against the real server, tokens/second from the")
-print("  server's own timing field. The quantized arms were served from a")
-print("  pre-quantized artifact, not a startup-time quantization.")
+print("  s/request is the comparison to read: the diffusion decoder runs a fixed")
+print("  step count, so latency is flat and tok/s tracks answer length instead of")
+print("  speed. Measured over HTTP against the real server; the quantized arms")
+print("  were served from a pre-quantized artifact, not a startup quantization.")
 PY
 
 log "done -- results in $OUT"
