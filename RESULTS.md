@@ -24,8 +24,9 @@ the memory** -- quantized and faster at the same time. Numbers in
 - [7. Routing imbalance](#7-routing-imbalance)
 - [8. Should the fused kernel be built?](#8-should-the-fused-kernel-be-built)
 - [9. Hardware portability](#9-hardware-portability)
-- [10. Corrections made during the investigation](#10-corrections-made-during-the-investigation)
-- [11. What is not established](#11-what-is-not-established)
+- [10. Offline quantization](#10-offline-quantization)
+- [11. Corrections made during the investigation](#11-corrections-made-during-the-investigation)
+- [12. What is not established](#12-what-is-not-established)
 
 ---
 
@@ -452,7 +453,88 @@ machine in one session for exactly this reason.
 
 ---
 
-## 10. Corrections made during the investigation
+## 10. Offline quantization
+
+`MEASURED` on the real checkpoint, A6000. Every other result in this document
+came from a model quantized at *startup*. `tools/quantize_checkpoint.py` does
+the work once and writes an artifact.
+
+| | |
+|---|---|
+| MSE scale search, 6.44 B expert weights, grid 24 | **13.1 s** on the GPU |
+| write | 13.1 s |
+| read-back verify | 7.4 s — 211 tensors bit-exact, 32 re-derivable tensors correctly absent |
+| source checkpoint | 13.71 GiB |
+| **artifact** | **7.89 GiB (0.576x)** |
+
+The artifact ratio is 0.576x rather than the experts' own 0.516x because
+embeddings, the LM head, attention and norms stay BF16 by design.
+
+### It is bit-identical to quantizing at startup
+
+The claim that an offline artifact is interchangeable with a startup-time
+quantization is only worth anything if it is checked, because the failure would
+be silent: a slightly different set of scales still loads, still runs, and still
+produces plausible text.
+
+A fresh process rebuilt the model from the source weights, requantized it from
+scratch, and compared every tensor against the file:
+
+```
+compared      : 211 tensors (64 packed expert buffers)
+mismatched    : 0
+VERDICT       : IDENTICAL - offline == startup
+```
+
+So the artifact changes the bytes on disk, the provenance and the startup scale
+search — and **nothing else**. Accuracy and inference speed are untouched, and
+sections 4 and 5 transfer unchanged.
+
+### One artifact serves both execution modes
+
+The BF16 experts are re-derivable and never stored, so both modes write
+byte-identical files and residency is chosen at load time. The artifact above
+was written as PACKED; loaded with `--execution-mode reference` on the real
+model it gives:
+
+| loaded as | resident | matches section 2 |
+|---|---|---|
+| `packed` | 13.70 → **7.89 GiB (0.576x)** | yes |
+| `reference` | 13.70 → **19.89 GiB (1.452x)** | yes, 1.452x exactly |
+
+One file for the deployment run and the accuracy run.
+
+### Served end to end
+
+`serve_quantized.py --quantized-checkpoint ... --execution-mode packed --fused`
+brings up the inference repository's own server on the artifact, with all 16
+expert blocks consuming packed INT8 through the fused W8A16 kernel, and answers
+requests correctly (`17 x 4` → `68`).
+
+### What it does not buy
+
+Loading the artifact **still reads the BF16 weights first**. Model construction
+belongs to the inference repository, which this project does not modify, so the
+artifact saves the scale search and nothing else. Skipping the BF16 read would
+need a meta-device build path on the inference side.
+
+### A bug this path exposed
+
+Serving the artifact with `--fused` failed on the first request with
+`Pointer argument cannot be accessed from Triton (cpu tensor?)`. safetensors
+reads to CPU, and the loader registered those tensors as-is, so inside a CUDA
+model the packed integers stayed on the host. Nothing upstream noticed —
+dequantization moves data, so resident accounting reported 0.576x and the
+reconstructed weights were numerically correct. Only the fused kernel, which
+consumes the packed buffers directly, saw the split. Buffers now land on their
+parent module's device, with two CUDA-gated tests.
+
+This is the general shape of the risk: **a quantization bug that only the fast
+path can see.** Every dequantizing path would have hidden it.
+
+---
+
+## 11. Corrections made during the investigation
 
 Recording these because several were wrong in ways that would have produced
 confident false conclusions.
@@ -465,6 +547,7 @@ confident false conclusions.
 | "The GEMM is compute-bound like prefill, so weight-only quantization is the wrong lever" | At batch 1 it is firmly **memory-bound** — routing scatters tokens 8-way across 64 experts, so M/expert is 4–16. |
 | GSM8K "88.0% baseline" | Not reproducible on this hardware. The baseline here is **75.5%**. |
 | Two GSM8K runs labelled bf16 / int4 | **Both were BF16** — the server was never restarted. Caught because the outputs were byte-identical, which is impossible for models that diverge 47.7%. A `/v1/quantization` endpoint now makes the served model checkable over HTTP. |
+| "The artifact loads fine, the numbers look right" | **The packed buffers were on the CPU inside a CUDA model.** safetensors reads to host memory and the loader registered those tensors as-is. Resident accounting, dequantization and numerics were all correct, so only the fused kernel — the one path that touches the packed buffers directly — caught it, at request time. See section 10. |
 
 Tooling-level failures caught by the toolkit's own guards: `verify_replay`
 detected a 6-point drift between on-device capture and offline replay (`argmax`
@@ -473,14 +556,15 @@ damage.
 
 ---
 
-## 11. What is not established
+## 12. What is not established
 
 - **Statistical significance.** "No detectable cost" is not "no cost". p = 0.585
   (INT8) and p = 0.179 (INT4) mean the tests cannot resolve these gaps at n=200.
   Settling INT4's −6 points needs ~864 questions per arm; the full 1319-item
   GSM8K test set would do it.
-- **Any speedup.** No kernel consumes packed weights. Every speed number here is
-  a cost.
+- **Serving throughput as a whole.** The fused W8A16 kernel does consume packed
+  weights and is faster than BF16 (section 5), but only the grouped-expert path
+  is fused; the rest of the model is unchanged.
 - **End-to-end serving throughput.** All latency was measured on the dense
   forward at batch 1, not through `generate_cached` with KV caching and batching.
   The ~249 ms tax is per forward, so the cached path pays it more often, not

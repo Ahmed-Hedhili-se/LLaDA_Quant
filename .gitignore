@@ -33,6 +33,8 @@ htmlcov/
 quantized_checkpoints/
 *-int4/
 *-int8/
+*-int4-*/
+*-int8-*/
 
 # Measurement outputs. Traces and routing dumps are reproducible from the
 # benchmarks; only the numbers quoted in the docs are worth versioning.

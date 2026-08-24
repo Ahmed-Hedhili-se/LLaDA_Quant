@@ -74,7 +74,8 @@ trajectory  (depends only on validation.metrics)
 | **F. Measurement** | `memory.py`, `validation/`, `analysis/` | Every number the project reports | torch only |
 | **G. Trajectory** | `trajectory/` | What quantization does to diffusion generation | validation.metrics |
 | **H. Benchmarks** | `benchmarks/` | Runnable, category-labelled measurement scripts | A, F |
-| **I. Tests** | `tests/unit/` | 198 tests, several of them regression guards for real past bugs | all |
+| **I. Tests** | `tests/unit/` | 244 tests, several of them regression guards for real past bugs | all |
+| **J. Tools** | `tools/` | Non-measurement executables — currently offline quantization | A, E |
 
 ---
 
@@ -378,13 +379,27 @@ these many bytes to these many".
 | `find_weights_file(dir)` | Resolves the glob; raises on missing or ambiguous. |
 | `checkpoint_size_bytes(dir)` | Makes artifact size a measured quantity. |
 | `load_quantized_checkpoint(dir)` | Raw tensors + manifest, no model touched. |
-| `load_quantized_weights(model, dir, strict)` | Model-level load. |
-| `_register_missing_buffers()` | Lets a *plain* model absorb a quantized checkpoint. |
+| `load_quantized_weights(model, dir, strict, execution_mode)` | Model-level load. `execution_mode` overrides what the manifest recorded. |
+| `_register_missing_buffers()` | Lets a *plain* model absorb a quantized checkpoint, on the parent module's device. |
 
 **The redundancy fix.** The predecessor saved the BF16 weights *and* the packed
 buffers even though the load path recomputed the former from the latter,
 making a "quantized" checkpoint 1.52× the unquantized one. Now they are
 dropped at save time, in **both** execution modes.
+
+**Residency is not a property of the file.** Both execution modes write
+byte-identical artifacts — the BF16 experts are re-derivable and dropped in
+either case — so `execution_mode=` at load time selects PACKED or REFERENCE
+without rewriting anything. One artifact serves the deployment run and the
+accuracy run. A test asserts the two modes produce identical bytes, and
+another that an override never touches the file on disk.
+
+**The device fix.** safetensors reads to CPU. `_register_missing_buffers`
+registered those tensors as-is, so inside a CUDA model the packed integers
+stayed on the host. Nothing upstream noticed — dequantization moves data, so
+resident accounting and numerics were both correct — and only the fused
+kernel, which consumes the packed buffers directly, saw the split, at request
+time. Buffers now land on their parent module's device.
 
 **The strictness consequence.** Those keys are then legitimately missing at
 load. `load_quantized_weights` calls `load_state_dict(strict=False)` and
@@ -649,12 +664,56 @@ measures **and what it does not**.
 `bench_moe_regime.py` accepts `--routing-file` to replace the ideal-balance
 assumption with a real `topk_ids` tensor.
 
-Two categories are **absent on purpose**: a kernel benchmark (the kernel does
-not exist) and an end-to-end benchmark (needs the inference repo and a GPU).
-
 The predecessor, `bench_experts.py`, was deleted: it dequantized to BF16 and
 then timed the same BF16 computation twice, reporting the difference as an
 INT8 result.
+
+> **This section is behind the code.** `runtime/kernels/w8a16_gemm.py`,
+> `runtime/kernels/w8a16_moe.py`, `runtime/fused_block.py`,
+> `benchmarks/bench_fused_e2e.py` and `benchmarks/serve_quantized.py` all exist
+> and are not described anywhere in this document. README.md and RESULTS.md
+> carry the current numbers; this file has not caught up.
+
+---
+
+## 10b. Part J — Tools
+
+**Role.** Executables that produce artifacts rather than measurements.
+
+### `tools/quantize_checkpoint.py`
+
+Quantizes the real weights **once**, offline, into a standalone artifact.
+Everything else in the repository quantizes at startup.
+
+| Step | Detail |
+|---|---|
+| build | `llada_repo.build_bf16_model` — the inference repo's own model, imported |
+| quantize | `llada_repo.quantize_experts_streaming` on the GPU; 13.1 s for 6.44 B weights |
+| write | `save_quantized_checkpoint` |
+| verify | re-reads the file and compares it against memory tensor by tensor, and asserts the re-derivable BF16 experts are absent |
+
+Measured on the real checkpoint: 13.71 → 7.89 GiB (0.576×), and the result is
+**bit-identical** to a startup-time quantization — 211 tensors, 0 mismatches,
+checked from a fresh process that rebuilt and requantized the model.
+
+`serve_quantized.py --quantized-checkpoint DIR` loads it. `--bits`,
+`--group-size`, `--scale-search` and `--search-grid` then come from the
+manifest, and a command line that contradicts it is rejected rather than
+ignored: a server started with `--bits 4` against an INT8 artifact would
+otherwise serve INT8 and label itself INT4, which is the same class of bug
+that once produced two identical GSM8K result files from one unchanged server.
+
+**What it does not buy.** Accuracy and inference speed are unchanged, and the
+BF16 weight read still happens — model construction belongs to the inference
+repository, which this project does not modify, so the artifact saves the
+scale search and nothing else.
+
+### `src/LLaDA_Quant/llada_repo.py`
+
+`build_bf16_model` and `quantize_experts_streaming`, shared by
+`bench_bf16_vs_int4.py` and `tools/quantize_checkpoint.py`. The only module in
+the package that knows the inference repository's layout (`model_update.model`,
+`src.model.load_weights`); everything else works on any `nn.Module`.
 
 ---
 

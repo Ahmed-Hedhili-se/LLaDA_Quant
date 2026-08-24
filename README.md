@@ -363,6 +363,56 @@ save_quantized_checkpoint(
 )
 ```
 
+### Or quantize the weights once, offline
+
+`MEASURED` on the real checkpoint, A6000.
+
+```bash
+python tools/quantize_checkpoint.py \
+    --repo ~/test_llada --weight-dir ~/test_llada/weights \
+    --out ~/llada-moe-int8-g128 \
+    --bits 8 --group-size 128 --scale-search mse \
+    --build-device cuda:0 --quantize-device cuda:0
+
+python benchmarks/serve_quantized.py \
+    --repo ~/test_llada --weight-dir ~/test_llada/weights \
+    --quantized-checkpoint ~/llada-moe-int8-g128 \
+    --execution-mode packed --fused
+```
+
+| | |
+|---|---|
+| MSE scale search over 6.44 B expert weights | **13.1 s** on the GPU |
+| artifact | **13.71 → 7.89 GiB (0.576x)** |
+| read-back check | 211 tensors bit-exact, 32 re-derivable tensors correctly absent |
+| vs quantizing at startup | **bit-identical** — 211 tensors, 0 mismatches, fresh process |
+
+**What the artifact changes:** the bytes on disk, the provenance (the manifest
+pins bits, group size, search and the source), and the startup scale search.
+
+**What it does not change:** accuracy or inference speed, by a single digit.
+The search is deterministic, so the artifact holds exactly the tensors a
+startup-time run derives. That is measured above, not assumed — a fresh
+process rebuilt the model, requantized from scratch, and matched all 211
+tensors including the 64 packed expert buffers.
+
+**Residency is not baked in.** The saved bytes are the same for either
+execution mode, because the BF16 experts are re-derivable and never stored. So
+`load_quantized_weights(..., execution_mode=...)` picks PACKED or REFERENCE at
+load time and one artifact serves both the deployment run and the accuracy run.
+
+**One honest caveat.** Loading the artifact still builds the BF16 model first
+and then overwrites the experts, because model construction belongs to the
+inference repository and this project does not modify it. The artifact saves
+the *scale search*, not the BF16 weight read. Skipping that too would need a
+meta-device build path on the inference side.
+
+When `--quantized-checkpoint` is given, `--bits`, `--group-size`,
+`--scale-search` and `--search-grid` come from the manifest, and a command line
+that contradicts it is **rejected rather than ignored** — a server started with
+`--bits 4` against an INT8 artifact would otherwise serve INT8 and label itself
+INT4.
+
 ---
 
 ## Targeting is explicit
@@ -442,8 +492,17 @@ storing them made the "quantized" checkpoint 1.52x the size of the
 unquantized one. Their absence at load time is expected and never counts as a
 missing key; any *other* missing or unexpected key still raises.
 
+**The artifact is execution-mode independent.** Both modes write byte-identical
+files, so residency belongs to the run rather than the file:
+`load_quantized_weights(model, directory, execution_mode="reference")`
+overrides what the manifest recorded without touching the artifact. Write it
+once for deployment, load it in REFERENCE for the accuracy run.
+
 Loading into a plain model works: packed buffers are registered on the fly and
-expert access is re-installed. The effective group size is recovered from the
+expert access is re-installed. Each buffer lands on the device its parent
+module already occupies — safetensors reads to CPU, and leaving the packed
+integers there inside a CUDA model produced a split that dequantization hid
+(it moves data anyway) and only the fused kernel caught, at request time. The effective group size is recovered from the
 scale tensor's shape rather than the config, because `quantize_tensor` falls
 back to per-tensor scaling when the group size does not divide K — trusting
 the config there would dequantize with the wrong grouping and produce garbage
@@ -811,6 +870,12 @@ Three categories, each stating what it measures and what it does not.
 | *(none yet)* | C — kernel | BF16 vs INT8 vs INT4 fused MoE | **the kernel does not exist** |
 | *(none yet)* | D — end to end | tokens/s, latency, memory, batch, steps | needs the inference repo and a GPU |
 
+`tools/` holds the non-measurement executables:
+
+| Script | Does |
+|---|---|
+| `tools/quantize_checkpoint.py` | quantizes the real weights once, offline, into a reusable artifact, and verifies the write by reading it back tensor by tensor |
+
 `v0.1`'s `bench_experts.py` was **deleted**: it dequantized to BF16 and then
 timed the same BF16 computation twice, reporting the difference as an INT8
 result, and computed "47% memory saving" from packed tensors while the BF16
@@ -909,8 +974,9 @@ pip install -e ".[dev]"
 pytest tests
 ```
 
-`MEASURED`: **198 passed, 1 skipped** (the skip binds to the real inference
-repo, which needs Triton and CUDA).
+`MEASURED` on the A6000: **244 passed, 15 skipped**. The skips bind to the real
+inference repository, which has to be importable; two CUDA-gated
+device-placement tests run there and are skipped on a CPU-only box.
 
 | File | Covers |
 |---|---|
@@ -919,7 +985,8 @@ repo, which needs Triton and CUDA).
 | `test_scale_search.py` | MSE search beats amax on its own objective, INT4 gains and INT8 does not, storage layout and dequantize formula unchanged, config wiring and checkpoint roundtrip |
 | `test_memory.py` | resident-memory regression guards for the v0.1 bug |
 | `test_targeting.py` | structural detection, component globs, loud failures, audit trail |
-| `test_checkpoint_format.py` | no BF16 duplicates, bit-exact roundtrip, group-size recovery, manifest |
+| `test_checkpoint_format.py` | no BF16 duplicates, bit-exact roundtrip, group-size recovery, manifest, mode-independent bytes and load-time `execution_mode` override, CUDA buffer placement |
+| `test_benchmarks_importable.py` | every script in `benchmarks/` and `tools/` parses and its `--help` works |
 | `test_quantlinear.py` | `QuantLinear` vs `nn.Linear` |
 | `test_llada_moe_adapter.py` | both modes, per-access dequantization, restore |
 | `test_api.py` | result surface, modes, non-destructive variants |
