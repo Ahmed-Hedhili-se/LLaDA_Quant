@@ -77,6 +77,48 @@ def test_install_switches_int8_blocks():
 
 
 @needs_repo
+@torch.no_grad()
+def test_the_packed_int8_buffers_are_what_the_kernel_reads():
+    """Mutate the INT8 buffer; the output must change.
+
+    Every other test here compares the fused path against another quantized
+    path, so all of them would still pass if the fused forward were quietly
+    reading a BF16 copy from somewhere. This one cannot: it perturbs the packed
+    integers and requires the output to follow.
+    """
+    from LLaDA_Quant.runtime import fused_block
+
+    model, cfg = _build_model(bits=8)
+    fused_block.install(model, strict=True)
+    block = model.layers[0].mlp
+
+    # Nothing to fall back to: PACKED deletes the BF16 Parameters.
+    resident = dict(block.named_parameters())
+    assert "w1" not in resident and "w2" not in resident, (
+        f"a BF16 expert Parameter is still resident: {sorted(resident)}"
+    )
+    assert block._qw1.dtype == torch.int8 and block._qw2.dtype == torch.int8
+
+    torch.manual_seed(0)
+    x = torch.randn(1, 16, cfg.H, dtype=torch.bfloat16, device="cuda")
+    before = block(x).clone()
+
+    original = block._qw1.clone()
+    try:
+        block._qw1.zero_()
+        after = block(x)
+        assert not torch.equal(before, after), (
+            "zeroing the packed INT8 weights changed nothing -- the fused kernel "
+            "is not reading them"
+        )
+    finally:
+        block._qw1.copy_(original)
+
+    restored = block(x)
+    assert torch.equal(before, restored), "restoring the buffer did not restore the output"
+
+
+@needs_repo
 def test_leaves_packed_int4_alone():
     """INT4 has no fused path; silently serving it wrong would be the bug."""
     from LLaDA_Quant.runtime import fused_block
