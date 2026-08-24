@@ -246,23 +246,44 @@ number that section 7's fused arm is compared against.
 
 ## 8. Correctness — GSM8K
 
-### Use the script
+### Use the script — detached
 
 ```bash
-bash tools/run_gsm8k_comparison.sh              # n=200, ~50 min total
-LIMIT=8 bash tools/run_gsm8k_comparison.sh      # smoke run first, ~4 min
+cd ~/LLaDA_Quant
+nohup bash tools/run_gsm8k_comparison.sh > ~/gsm8k.log 2>&1 &
+tail -f ~/gsm8k.log        # Ctrl-C stops watching, not the run
+```
+
+**Run it detached.** A dropped ssh connection SIGHUPs the foreground process
+group and takes the script, the grader and the server with it. That already
+happened: an n=200 run died at question 127 and lost 25 minutes of grading
+with nothing on disk. The script warns if you start it on a TTY with
+`LIMIT >= 100`.
+
+For a quick plumbing check first (~4 min, safe in the foreground):
+
+```bash
+LIMIT=8 bash tools/run_gsm8k_comparison.sh
 ```
 
 It activates the venv itself, so it works from a bare login shell and does
-not depend on the `export` block at the top of this file. Everything is
-overridable: `REPO`, `WEIGHTS`, `ART`, `PORT`, `LIMIT`, `SEED`, `MODE`, `OUT`.
+not depend on the `export` block at the top of this file. Overridable:
+`REPO`, `WEIGHTS`, `ART`, `PORT`, `LIMIT`, `SEED`, `MODE`, `OUT`. For INT4,
+pass `ART=~/llada-moe-int4-g128`.
 
-The script exists because the manual version below **cannot be pasted as a
-block** — each server runs in the foreground and never returns — and because
-it enforces the check that matters: it reads `/v1/quantization` on each arm
-and aborts if both report the same label. Two arms serving the same model
-produce a meaningless delta, which already happened once and was caught only
-because the outputs were byte-identical.
+**Re-running resumes.** An arm whose result already covers `LIMIT` questions
+is reused rather than re-graded, so a crash costs the arm in flight, not the
+finished one. The count has to match and the JSON has to parse, so neither a
+leftover smoke run nor a truncated file from a killed grader can stand in for
+a real result. Output goes to `~/gsm8k-results/n<LIMIT>/`.
+
+The script also reads `/v1/quantization` on each arm and **aborts if both
+report the same label**. Two arms serving the same model produce a
+meaningless delta — that happened once, and was caught only because the
+outputs were byte-identical.
+
+Below n=100 it prints the delta but refuses the interpretation: at n=8 one
+question is 12.5 points, which reads like a finding and is not one.
 
 ### Or by hand, one command per shell
 
