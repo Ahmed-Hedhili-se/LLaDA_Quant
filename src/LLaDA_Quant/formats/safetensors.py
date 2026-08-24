@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import glob
 import os
+from dataclasses import replace
 from typing import List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file, save_file
 
-from ..config import QuantConfig
+from ..config import ExecutionMode, QuantConfig
 from .manifest import (
     MANIFEST_FILENAME,
     SOURCE_FILENAME,
@@ -142,6 +143,7 @@ def load_quantized_weights(
     model: nn.Module,
     directory: str,
     strict: bool = True,
+    execution_mode: Optional[str] = None,
 ) -> QuantizationManifest:
     """Load a quantized checkpoint into ``model`` (plain or already quantized).
 
@@ -149,9 +151,25 @@ def load_quantized_weights(
     are *expected* to be absent from the checkpoint; they are re-derived after
     loading, so their absence never counts as a missing key. Any other missing
     or unexpected key is a real mismatch and raises when ``strict``.
+
+    ``execution_mode`` overrides the residency mode recorded in the manifest.
+    The artifact holds the same bytes either way -- ``derivable_tensor_names``
+    strips the BF16 experts in REFERENCE mode and they are already gone in
+    PACKED -- so residency is a property of *this* run, not of the file. A
+    checkpoint written for deployment can therefore be loaded in REFERENCE for
+    an accuracy run without rewriting it. The returned manifest reflects the
+    mode actually applied.
     """
     state, manifest = load_quantized_checkpoint(directory)
     config: Optional[QuantConfig] = manifest.config
+    if execution_mode is not None:
+        if config is None:
+            raise ValueError(
+                "cannot override execution_mode: the manifest carries no quantization "
+                "config, so there is nothing to restore expert access with."
+            )
+        config = replace(config, execution_mode=ExecutionMode(execution_mode).value)
+        manifest = replace(manifest, config=config)
     _register_missing_buffers(model, state)
 
     expected_missing = derivable_tensor_names(manifest)

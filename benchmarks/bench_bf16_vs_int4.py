@@ -55,6 +55,8 @@ from LLaDA_Quant import (
     resident_memory,
 )
 from LLaDA_Quant.analysis import LLADA_MOE_7B_A1B, expert_token_stats
+from LLaDA_Quant.llada_repo import build_bf16_model, quantize_experts_streaming
+from LLaDA_Quant.llada_repo import timer as _timer
 from LLaDA_Quant.trajectory import (
     LLADA_MASK_ID,
     TrajectoryReport,
@@ -74,83 +76,9 @@ from LLaDA_Quant.trajectory import (
 
 
 # --------------------------------------------------------------------------
-# Model construction (mirrors compare_models.py::load_ours, read-only)
+# Model construction -- see LLaDA_Quant.llada_repo for the build/quantize
+# helpers, which tools/quantize_checkpoint.py shares with this benchmark.
 # --------------------------------------------------------------------------
-
-
-def _timer(label: str):
-    """Print a stage banner now and its duration when the returned fn is called."""
-    import time
-
-    print(f"  {label} ...", flush=True)
-    start = time.perf_counter()
-
-    def done() -> None:
-        print(f"  {label}: {time.perf_counter() - start:.1f}s", flush=True)
-
-    return done
-
-
-def build_bf16_model(repo: str, weight_dir: str, build_device: str = "cpu"):
-    """Build the fused-MoE BF16 model, the way the inference repo does.
-
-    ``build_device`` decides where construction happens, and it is a pure
-    speed/VRAM trade:
-
-    * ``"cpu"`` (default): safe anywhere. Random-initialising 6.4B parameters
-      and fusing 16 blocks costs ~100 s of host CPU.
-    * ``"cuda:0"``: the same work on the GPU takes seconds, but the unfused
-      model is ~14 GB of VRAM before fusing and the comparison needs a second
-      model afterwards. Only worth it with roughly 40 GB or more; on a 24 GB
-      card two BF16 models do not fit at all, which is why CPU is the default.
-    """
-    if repo not in sys.path:
-        sys.path.insert(0, repo)
-    from model_update.model import LLaDAMoEKV, TritonFusedMoEBlock
-    from src.model import load_weights
-
-    index = os.path.join(weight_dir, "model.safetensors.index.json")
-    if not os.path.exists(index):
-        raise FileNotFoundError(
-            f"no checkpoint index at {index}. Cloning the inference repo does not "
-            "bring the ~14 GB of weights; fetch them first, e.g.  "
-            "huggingface-cli download inclusionAI/LLaDA-MoE-7B-A1B-Instruct "
-            f"--local-dir {weight_dir}"
-        )
-
-    # Construct directly in BF16. The unfused model is 3072 expert Linears
-    # (64 experts x 3 projections x 16 layers); at the default fp32 that is
-    # ~25.6 GB of randomly initialised memory, plus another 12.8 GB for the
-    # .to(bfloat16) copy. On a host with less RAM than that it swaps, and
-    # construction takes tens of minutes instead of a couple.
-    step = _timer(f"allocating unfused model (BF16) on {build_device}")
-    previous_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.bfloat16)
-    try:
-        with torch.device(build_device):
-            model = LLaDAMoEKV(use_fused_moe=False)
-    finally:
-        torch.set_default_dtype(previous_dtype)
-    model = model.to(torch.bfloat16).eval()
-    step()
-
-    step = _timer("loading weights")
-    load_weights(model, weight_dir, verbose=False)
-    step()
-
-    # Fuse AFTER loading: load_state_dict_from_unfused writes w1[i] in place,
-    # which is precisely what PACKED mode cannot accept.
-    step = _timer(f"fusing {len(model.layers)} MoE blocks on {build_device}")
-    for index, layer in enumerate(model.layers):
-        with torch.device(build_device):
-            fused = TritonFusedMoEBlock(layer.mlp.cfg)
-        fused = fused.to(device=build_device, dtype=torch.bfloat16)
-        fused.load_state_dict_from_unfused(layer.mlp)
-        layer.mlp = fused
-        if build_device == "cpu":
-            print(f"    layer {index + 1}/{len(model.layers)} fused", flush=True)
-    step()
-    return model.eval()
 
 
 def int4_config(group_size: int, search: str, search_grid: int = 24) -> QuantConfig:
@@ -163,44 +91,6 @@ def int4_config(group_size: int, search: str, search_grid: int = 24) -> QuantCon
         search_grid=search_grid,
         expect_expert_blocks=LLADA_MOE_7B_A1B.num_layers,
     )
-
-
-def quantize_experts_streaming(model, config, device, verbose: bool = True):
-    """Quantize expert blocks one at a time on ``device``.
-
-    MSE scale search is ``search_grid`` passes over every weight, each
-    allocating GB-scale temporaries. On 6.4B parameters that is tens of minutes
-    of CPU. On a GPU it is seconds -- but the whole BF16 second model does not
-    fit next to the reference, so blocks are moved across one at a time.
-
-    Peak VRAM is the reference (~13.7 GB) plus the packed buffers accumulated so
-    far (growing to ~3.2 GB) plus one block's BF16 weights in flight (~1.6 GB).
-
-    Bypasses ``api.quantize_model`` because that quantizes the whole tree at
-    once, so the match-count assertion is re-applied here by hand.
-    """
-    from LLaDA_Quant.adapters.llada_moe import find_expert_blocks, quantize_llada_experts
-    from LLaDA_Quant.api import QuantizationResult, TargetingError
-
-    blocks = find_expert_blocks(model, config)
-    expected = config.expect_expert_blocks
-    if expected is not None and len(blocks) != expected:
-        raise TargetingError(
-            f"expected {expected} expert block(s), matched {len(blocks)}: "
-            f"{[name for name, _, _ in blocks]}"
-        )
-    if not blocks:
-        raise TargetingError("quantization matched no expert blocks")
-
-    records = []
-    for index, (name, block, _shape) in enumerate(blocks, start=1):
-        block.to(device)
-        for record in quantize_llada_experts(block, config):
-            record.name = name or record.name
-            records.append(record)
-        if verbose:
-            print(f"    {index}/{len(blocks)} {name} quantized on {device}", flush=True)
-    return QuantizationResult(config=config, targets=records)
 
 
 def build_model_pair(repo: str, weight_dir: str, args):

@@ -18,16 +18,19 @@ import sys
 
 import pytest
 
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 BENCHMARKS = sorted(
-    (pathlib.Path(__file__).resolve().parents[2] / "benchmarks").glob("*.py")
+    script
+    for directory in ("benchmarks", "tools")
+    for script in (ROOT / directory).glob("*.py")
 )
 
 
 def test_there_are_benchmarks_to_check():
-    assert BENCHMARKS, "benchmarks/ is empty; this guard would silently pass"
+    assert BENCHMARKS, "benchmarks/ and tools/ are empty; this guard would silently pass"
 
 
-@pytest.mark.parametrize("script", BENCHMARKS, ids=lambda p: p.name)
+@pytest.mark.parametrize("script", BENCHMARKS, ids=lambda p: f"{p.parent.name}/{p.name}")
 def test_benchmark_parses(script: pathlib.Path):
     try:
         ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
@@ -35,7 +38,7 @@ def test_benchmark_parses(script: pathlib.Path):
         pytest.fail(f"{script.name} does not parse: line {exc.lineno}: {exc.msg}")
 
 
-@pytest.mark.parametrize("script", BENCHMARKS, ids=lambda p: p.name)
+@pytest.mark.parametrize("script", BENCHMARKS, ids=lambda p: f"{p.parent.name}/{p.name}")
 def test_benchmark_help_works(script: pathlib.Path):
     """``--help`` exercises imports and the whole argparse setup."""
     result = subprocess.run(

@@ -40,8 +40,46 @@ import threading
 
 import torch
 
-from LLaDA_Quant import QuantConfig, compare_resident_memory, quantize_model, resident_memory
+from LLaDA_Quant import (
+    QuantConfig,
+    compare_resident_memory,
+    load_quantized_weights,
+    quantize_model,
+    resident_memory,
+)
 from LLaDA_Quant.analysis import LLADA_MOE_7B_A1B
+
+
+# Flags the manifest owns once --quantized-checkpoint is given. Mapping each
+# to its config field lets a disagreement be reported instead of ignored: a
+# server started with "--bits 4" against an INT8 artifact would otherwise serve
+# INT8 and label itself INT4, which is the failure mode that once produced two
+# "different" GSM8K runs from one unchanged model.
+MANIFEST_OWNED = {
+    "--bits": "bits",
+    "--group-size": "group_size",
+    "--scale-search": "scale_search",
+    "--search-grid": "search_grid",
+}
+
+
+def reject_conflicting_flags(args, config, artifact: str) -> None:
+    """Fail if the command line contradicts the artifact it is loading."""
+    passed = {a.split("=", 1)[0] for a in sys.argv[1:] if a.startswith("--")}
+    conflicts = [
+        f"{flag}={getattr(args, field)} but the artifact is "
+        f"{field}={getattr(config, field)}"
+        for flag, field in MANIFEST_OWNED.items()
+        if flag in passed and getattr(args, field) != getattr(config, field)
+    ]
+    if conflicts:
+        raise SystemExit(
+            f"command line contradicts {artifact}:\n  "
+            + "\n  ".join(conflicts)
+            + "\nThese come from the manifest when "
+            "--quantized-checkpoint is used. Drop the flags, or point at an "
+            "artifact that matches."
+        )
 
 
 def main() -> None:
@@ -55,6 +93,13 @@ def main() -> None:
                         choices=["ours", "ours_kv", "fast_dense", "hf"])
     parser.add_argument("--no-quantize", action="store_true",
                         help="serve BF16 unmodified; the baseline arm")
+    parser.add_argument("--quantized-checkpoint", default=None,
+                        help="load a pre-quantized artifact written by "
+                             "tools/quantize_checkpoint.py instead of running the "
+                             "scale search at startup. --bits/--group-size/"
+                             "--scale-search come from its manifest; "
+                             "--execution-mode still applies, because residency is "
+                             "a property of the run, not of the file.")
     parser.add_argument("--bits", type=int, default=4, choices=[4, 8])
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--scale-search", default="mse", choices=["amax", "mse"])
@@ -115,22 +160,52 @@ def main() -> None:
                 f"--backend {args.backend} does not build fused expert blocks, so "
                 "there is nothing for the expert adapter to match. Use fast_dense."
             )
-        config = QuantConfig(
-            bits=args.bits,
-            group_size=args.group_size,
-            targets=("expert",),
-            execution_mode=args.execution_mode,
-            scale_search=args.scale_search,
-            search_grid=args.search_grid,
-            expect_expert_blocks=LLADA_MOE_7B_A1B.num_layers,
-        )
         import copy
 
         before = copy.deepcopy(resident_memory(server.MODEL))
-        print(f"\nquantizing served model: {config.to_json()}")
-        result = quantize_model(server.MODEL, config)
+        if args.quantized_checkpoint:
+            artifact = os.path.abspath(os.path.expanduser(args.quantized_checkpoint))
+            print(f"\nloading pre-quantized artifact: {artifact}")
+            # execution_mode is deliberately overridden rather than read from the
+            # manifest: the artifact holds the same bytes either way, so residency
+            # belongs to this run. Everything else must come from the file.
+            manifest = load_quantized_weights(
+                server.MODEL, artifact, execution_mode=args.execution_mode
+            )
+            config = manifest.config
+            if config is None:
+                raise SystemExit(
+                    f"{artifact} carries no quantization config in its manifest, so "
+                    "expert access cannot be restored. It was not written by "
+                    "tools/quantize_checkpoint.py."
+                )
+            reject_conflicting_flags(args, config, artifact)
+            expert_blocks = sum(1 for t in manifest.targets if t.kind == "expert")
+            if expert_blocks != LLADA_MOE_7B_A1B.num_layers:
+                raise SystemExit(
+                    f"{artifact} holds {expert_blocks} expert block(s), expected "
+                    f"{LLADA_MOE_7B_A1B.num_layers}. It was built from a different "
+                    "model."
+                )
+            source = "pre-quantized artifact"
+            print(f"  INT{config.bits} g{config.group_size} {config.scale_search}, "
+                  f"{expert_blocks} expert blocks restored from packed buffers")
+        else:
+            config = QuantConfig(
+                bits=args.bits,
+                group_size=args.group_size,
+                targets=("expert",),
+                execution_mode=args.execution_mode,
+                scale_search=args.scale_search,
+                search_grid=args.search_grid,
+                expect_expert_blocks=LLADA_MOE_7B_A1B.num_layers,
+            )
+            print(f"\nquantizing served model: {config.to_json()}")
+            result = quantize_model(server.MODEL, config)
+            print(result.summary())
+            expert_blocks = len(result.expert_blocks)
+            source = "startup scale search"
         after = resident_memory(server.MODEL)
-        print(result.summary())
         print(f"resident: {before.total / 2**30:.2f} GiB -> {after.total / 2**30:.2f} GiB "
               f"({after.total / before.total:.3f}x)")
         if config.mode.value == "reference" and args.fused:
@@ -165,11 +240,12 @@ def main() -> None:
             "quantized": True,
             "fused_kernel": bool(fused_blocks),
             "fused_blocks": len(fused_blocks),
-            "label": (f"INT{args.bits} g{args.group_size} {args.scale_search} "
+            "label": (f"INT{config.bits} g{config.group_size} {config.scale_search} "
                       f"{args.execution_mode}"
                       + (" +fused-W8A16" if fused_blocks else "")),
             "config": config.to_dict(),
-            "expert_blocks": len(result.expert_blocks),
+            "expert_blocks": expert_blocks,
+            "weights_from": source,
             "resident_bytes": after.total,
             "resident_ratio": round(after.total / before.total, 4),
             "backend": args.backend,

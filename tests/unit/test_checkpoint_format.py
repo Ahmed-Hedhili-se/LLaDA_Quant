@@ -29,6 +29,7 @@ from LLaDA_Quant.formats.manifest import (
     TargetedModule,
     tensor_hash,
 )
+from LLaDA_Quant.runtime.moe import is_packed_expert_block
 from LLaDA_Quant.formats.safetensors import (
     checkpoint_size_bytes,
     derivable_tensor_names,
@@ -181,6 +182,76 @@ def test_strict_load_still_catches_a_real_mismatch(tmp_path):
     _save(model, QuantConfig(bits=8, group_size=64, targets=("expert",)), str(tmp_path))
     with pytest.raises(RuntimeError, match="state dict mismatch"):
         load_quantized_weights(TinyMoEModel(layers=1), str(tmp_path))
+
+
+# --------------------------------------------------------------------------
+# Residency is a property of the run, not of the file
+#
+# tools/quantize_checkpoint.py writes one artifact and both the deployment run
+# (PACKED) and the accuracy run (REFERENCE) load it. That only holds if the
+# saved bytes are mode-independent and the loader can override the mode.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+def test_the_two_modes_save_identical_bytes(tmp_path, bits):
+    """The BF16 experts are re-derivable, so residency never reaches the file."""
+    written = {}
+    for mode in (ExecutionMode.PACKED, ExecutionMode.REFERENCE):
+        torch.manual_seed(0)
+        directory = tmp_path / mode.value
+        config = QuantConfig(bits=bits, group_size=64, targets=("expert",),
+                             execution_mode=mode.value)
+        _save(TinyMoEModel(), config, str(directory))
+        written[mode] = load_file(find_weights_file(str(directory)))
+
+    packed, reference = written[ExecutionMode.PACKED], written[ExecutionMode.REFERENCE]
+    assert set(packed) == set(reference), "the two modes wrote different tensor sets"
+    for name in packed:
+        assert torch.equal(packed[name], reference[name]), f"{name} differs by mode"
+
+
+@pytest.mark.parametrize("saved,loaded", [
+    (ExecutionMode.PACKED, ExecutionMode.REFERENCE),
+    (ExecutionMode.REFERENCE, ExecutionMode.PACKED),
+])
+def test_execution_mode_can_be_overridden_at_load(tmp_path, saved, loaded):
+    torch.manual_seed(0)
+    model = TinyMoEModel()
+    config = QuantConfig(bits=4, group_size=64, targets=("expert",),
+                         execution_mode=saved.value)
+    _save(model, config, str(tmp_path))
+
+    fresh = TinyMoEModel(seed=11)
+    manifest = load_quantized_weights(fresh, str(tmp_path), execution_mode=loaded.value)
+    assert manifest.config.mode is loaded, "the returned manifest must report reality"
+
+    block = fresh.layers[0].mlp
+    assert is_packed_expert_block(block) is (loaded is ExecutionMode.PACKED)
+    resident = dict(block.named_parameters())
+    assert ("w1" in resident) is (loaded is ExecutionMode.REFERENCE)
+    # Whichever mode, the weights themselves must be the ones that were saved.
+    assert torch.equal(block.w1, model.layers[0].mlp.w1)
+    assert torch.equal(block.w2, model.layers[0].mlp.w2)
+
+
+def test_overriding_the_mode_does_not_mutate_the_file(tmp_path):
+    torch.manual_seed(0)
+    _save(TinyMoEModel(), QuantConfig(bits=8, group_size=64, targets=("expert",),
+                                      execution_mode="packed"), str(tmp_path))
+    before = json.loads((tmp_path / MANIFEST_FILENAME).read_text())
+    load_quantized_weights(TinyMoEModel(seed=2), str(tmp_path), execution_mode="reference")
+    after = json.loads((tmp_path / MANIFEST_FILENAME).read_text())
+    assert before == after, "an override rewrote the artifact on disk"
+    assert after["config"]["execution_mode"] == "packed"
+
+
+def test_an_unknown_execution_mode_is_rejected(tmp_path):
+    torch.manual_seed(0)
+    _save(TinyMoEModel(), QuantConfig(bits=8, group_size=64, targets=("expert",)),
+          str(tmp_path))
+    with pytest.raises(ValueError):
+        load_quantized_weights(TinyMoEModel(seed=2), str(tmp_path), execution_mode="turbo")
 
 
 # --------------------------------------------------------------------------
