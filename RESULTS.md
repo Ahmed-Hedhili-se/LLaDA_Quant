@@ -165,6 +165,29 @@ at 147, 149, 147 correct against BF16's 151, with p between 0.585 and 0.868.
 BF16 runs agree on all 200 individual questions. That is what makes the INT8
 arms comparable to each other rather than to a moving baseline.
 
+### The fused arm really is computing from INT8 `MEASURED`
+
+Worth checking rather than assuming, since every other fused test compares the
+kernel against *another quantized path* and would still pass if it were quietly
+reading a BF16 copy. On the real 7B model, loaded from the artifact exactly as
+served:
+
+```
+fused blocks installed          : 16
+BF16 expert Parameters resident : NONE
+_qw1 dtype/shape                : torch.int8 (64, 2048, 2048) cuda:0
+_sw1 dtype/shape                : torch.float32 (64, 2048, 16)
+
+zeroing _qw1 changed the output : True   (max |delta| 0.469)
+restoring _qw1 restored output  : True
+```
+
+Two independent reasons this is settled. PACKED **deletes** the BF16
+Parameters, so there is nothing to fall back to — `named_parameters()` has no
+`w1`/`w2`. And perturbing the packed integers moves the output and restoring
+them brings it back exactly, which no BF16-reading path could do.
+`tests/unit/test_fused_block.py` carries the same check as a permanent test.
+
 ### The two quantized paths disagree more with each other than with BF16
 
 | pair | churn | McNemar |
