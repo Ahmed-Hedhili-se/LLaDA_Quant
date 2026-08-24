@@ -63,6 +63,21 @@ CONFIDENCE="${CONFIDENCE:-0.9}"
 # the ~250 ms per-forward dequantization tax across ~12,800 forwards.
 MODE="${MODE:-reference}"
 
+# FUSED=1 grades the fused W8A16 kernel instead of the dequantize path. This is
+# a genuinely different computation, not just a different residency: the kernel
+# dequantizes inside the GEMM's K-loop and accumulates in fp32, where REFERENCE
+# and PACKED both dequantize to bf16 in HBM and hand cuBLAS a bf16 matrix. Same
+# weights, different arithmetic -- so its accuracy has to be measured, not
+# inherited from the REFERENCE run.
+FUSED="${FUSED:-0}"
+if [ "$FUSED" = "1" ]; then
+    MODE="packed"
+    QUANT_EXTRA="--fused"
+    OUT="${OUT:-$HOME/gsm8k-results/n$LIMIT-fused}"
+else
+    QUANT_EXTRA=""
+fi
+
 mkdir -p "$OUT"
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
@@ -179,7 +194,8 @@ if [ -t 1 ] && [ "$LIMIT" -ge 100 ]; then
 fi
 
 run_arm bf16 --no-quantize
-run_arm quant --quantized-checkpoint "$ART" --execution-mode "$MODE"
+# shellcheck disable=SC2086
+run_arm quant --quantized-checkpoint "$ART" --execution-mode "$MODE" $QUANT_EXTRA
 
 # Two arms that served the same model produce a meaningless delta. This is not
 # hypothetical: it happened, and was only caught because the outputs were
