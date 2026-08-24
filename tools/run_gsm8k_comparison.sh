@@ -11,11 +11,22 @@
 # runs the grader, stops the server, and refuses to report a comparison if the
 # two arms served the same model.
 #
-# Usage:
+# Usage -- run it DETACHED. A dropped ssh connection SIGHUPs the foreground
+# process group and takes the run with it; that already cost one n=200 arm at
+# question 127 of 200.
 #
-#     bash tools/run_gsm8k_comparison.sh                    # n=200, INT8 artifact
-#     LIMIT=50 bash tools/run_gsm8k_comparison.sh           # quick smoke run
-#     ART=~/llada-moe-int4-g128 bash tools/run_gsm8k_comparison.sh
+#     nohup bash tools/run_gsm8k_comparison.sh > ~/gsm8k.log 2>&1 &
+#     tail -f ~/gsm8k.log
+#
+# Other forms:
+#
+#     LIMIT=8 bash tools/run_gsm8k_comparison.sh            # smoke run, ~4 min
+#     ART=~/llada-moe-int4-g128 bash tools/...              # grade INT4 instead
+#
+# Re-running after a crash reuses any arm whose result already covers LIMIT
+# questions, so an interrupted run resumes rather than restarting. Results go
+# to ~/gsm8k-results/n<LIMIT>/, keyed by size so a smoke run can never be
+# mistaken for a real one.
 #
 # Everything is overridable by environment variable; the defaults match the
 # layout on the A6000 box.
@@ -30,7 +41,7 @@ ART="${ART:-$HOME/llada-moe-int8-g128}"
 PORT="${PORT:-8000}"
 LIMIT="${LIMIT:-200}"
 SEED="${SEED:-42}"
-OUT="${OUT:-$HOME/gsm8k-results}"
+OUT="${OUT:-$HOME/gsm8k-results/n$LIMIT}"
 
 # The inference repo's recommended config -- the one section 4 of RESULTS.md
 # was measured with. Changing these makes the numbers incomparable.
@@ -85,6 +96,20 @@ run_arm() {
     local logfile="$OUT/serve-$arm.log"
     local result="$OUT/gsm8k-$arm.json"
 
+    # Resume. An arm takes ~25 min at n=200; losing a finished one because the
+    # next stage died -- or because an ssh connection dropped -- is the
+    # expensive failure. A result is only reused if it graded the same number
+    # of questions, so a leftover smoke run never stands in for a real one.
+    if [ -f "$result" ]; then
+        local done_n
+        done_n=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['total'])"                  "$result" 2>/dev/null || echo 0)
+        if [ "$done_n" = "$LIMIT" ]; then
+            log "$arm: reusing $result ($done_n questions already graded)"
+            return 0
+        fi
+        log "$arm: discarding $result -- it graded $done_n, this run wants $LIMIT"
+    fi
+
     log "$arm: starting the server"
     stop_server
     python -u benchmarks/serve_quantized.py \
@@ -126,6 +151,23 @@ cat <<EOF
 EOF
 
 [ -d "$ART" ] || fail "no artifact at $ART -- run tools/quantize_checkpoint.py first"
+
+# A dropped ssh connection sends SIGHUP to the foreground process group and
+# takes the whole run with it, servers included. At n=200 that is ~50 minutes
+# of GPU time lost to a network blip -- which has already happened once, at
+# question 127 of 200.
+if [ -t 1 ] && [ "$LIMIT" -ge 100 ]; then
+    printf '
+[33m%s[0m
+' "WARNING: attached to a terminal, and this run takes ~50 minutes."
+    echo "  A dropped ssh connection will kill it. Prefer:"
+    echo
+    echo "      nohup bash tools/run_gsm8k_comparison.sh > ~/gsm8k.log 2>&1 &"
+    echo "      tail -f ~/gsm8k.log"
+    echo
+    echo "  Re-running after a crash reuses whichever arms already finished."
+    echo
+fi
 
 run_arm bf16 --no-quantize
 run_arm quant --quantized-checkpoint "$ART" --execution-mode "$MODE"
