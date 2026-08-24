@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+#
+# GSM8K, BF16 vs quantized, both arms end to end, one command.
+#
+# The manual procedure is three commands per arm that cannot be pasted as a
+# block, because the server runs in the foreground and never returns. Doing it
+# by hand also has a failure mode that already happened once: forgetting to
+# restart the server between arms produced two byte-identical result files that
+# looked like a clean "quantization changed nothing" finding. This script
+# starts each server, waits for it, records which model is actually serving,
+# runs the grader, stops the server, and refuses to report a comparison if the
+# two arms served the same model.
+#
+# Usage:
+#
+#     bash tools/run_gsm8k_comparison.sh                    # n=200, INT8 artifact
+#     LIMIT=50 bash tools/run_gsm8k_comparison.sh           # quick smoke run
+#     ART=~/llada-moe-int4-g128 bash tools/run_gsm8k_comparison.sh
+#
+# Everything is overridable by environment variable; the defaults match the
+# layout on the A6000 box.
+
+set -euo pipefail
+
+REPO="${REPO:-$HOME/test_llada}"
+WEIGHTS="${WEIGHTS:-$REPO/weights}"
+QUANT="${QUANT:-$HOME/LLaDA_Quant}"
+VENV="${VENV:-$HOME/venv}"
+ART="${ART:-$HOME/llada-moe-int8-g128}"
+PORT="${PORT:-8000}"
+LIMIT="${LIMIT:-200}"
+SEED="${SEED:-42}"
+OUT="${OUT:-$HOME/gsm8k-results}"
+
+# The inference repo's recommended config -- the one section 4 of RESULTS.md
+# was measured with. Changing these makes the numbers incomparable.
+MAX_TOKENS="${MAX_TOKENS:-1024}"
+STEPS="${STEPS:-512}"
+BLOCK_LENGTH="${BLOCK_LENGTH:-64}"
+CONFIDENCE="${CONFIDENCE:-0.9}"
+
+# REFERENCE, not PACKED: numerically identical (a test asserts the
+# reconstructed weights are torch.equal) but at BF16 speed. PACKED would pay
+# the ~250 ms per-forward dequantization tax across ~12,800 forwards.
+MODE="${MODE:-reference}"
+
+mkdir -p "$OUT"
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
+cd "$QUANT"
+
+log()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+fail() { printf '\n\033[31mFAILED: %s\033[0m\n' "$*" >&2; exit 1; }
+
+stop_server() {
+    # The bracket stops the pattern from matching this script's own pkill.
+    pkill -f "[s]erve_quantized" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        pgrep -f "[s]erve_quantized" >/dev/null || return 0
+        sleep 1
+    done
+    fail "a serve_quantized process survived pkill; stop it by hand"
+}
+
+wait_for_server() {
+    local logfile="$1" arm="$2"
+    for _ in $(seq 1 180); do
+        if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then
+            return 0
+        fi
+        # Do not wait out the full timeout on a server that already died.
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            tail -30 "$logfile" >&2
+            fail "$arm: the server exited during startup (log above)"
+        fi
+        sleep 5
+    done
+    tail -30 "$logfile" >&2
+    fail "$arm: the server did not become healthy within 15 minutes"
+}
+
+# run_arm <name> <extra serve_quantized args...>
+run_arm() {
+    local arm="$1"; shift
+    local logfile="$OUT/serve-$arm.log"
+    local result="$OUT/gsm8k-$arm.json"
+
+    log "$arm: starting the server"
+    stop_server
+    python -u benchmarks/serve_quantized.py \
+        --repo "$REPO" --weight-dir "$WEIGHTS" --port "$PORT" "$@" \
+        > "$logfile" 2>&1 &
+    SERVER_PID=$!
+    wait_for_server "$logfile" "$arm"
+
+    # What is actually being served, asked over HTTP rather than assumed from
+    # the command line. This is the check that catches a missed restart.
+    local label
+    label=$(curl -s "http://localhost:$PORT/v1/quantization" \
+            | python -c 'import json,sys; print(json.load(sys.stdin)["label"])')
+    printf '   serving: %s\n' "$label"
+    echo "$label" > "$OUT/label-$arm.txt"
+
+    log "$arm: grading GSM8K (limit=$LIMIT) -- this takes ~25 min at n=200"
+    ( cd "$REPO" && python eval/correctness/run_math_reasoning_code.py \
+        --task gsm8k --base-url "http://localhost:$PORT" \
+        --limit "$LIMIT" --seed "$SEED" \
+        --max-tokens "$MAX_TOKENS" --steps "$STEPS" \
+        --block-length "$BLOCK_LENGTH" --confidence-threshold "$CONFIDENCE" \
+        --config-name "$label" \
+        --output "$result" ) 2>&1 | tee "$OUT/eval-$arm.log"
+
+    stop_server
+    [ -f "$result" ] || fail "$arm: the grader wrote no $result"
+}
+
+log "config"
+cat <<EOF
+  repo        $REPO
+  weights     $WEIGHTS
+  artifact    $ART
+  limit       $LIMIT   seed $SEED
+  generation  max_tokens=$MAX_TOKENS steps=$STEPS block_length=$BLOCK_LENGTH threshold=$CONFIDENCE
+  quant mode  $MODE
+  output      $OUT
+EOF
+
+[ -d "$ART" ] || fail "no artifact at $ART -- run tools/quantize_checkpoint.py first"
+
+run_arm bf16 --no-quantize
+run_arm quant --quantized-checkpoint "$ART" --execution-mode "$MODE"
+
+# Two arms that served the same model produce a meaningless delta. This is not
+# hypothetical: it happened, and was only caught because the outputs were
+# byte-identical, which is impossible for models that actually diverge.
+if [ "$(cat "$OUT/label-bf16.txt")" = "$(cat "$OUT/label-quant.txt")" ]; then
+    fail "both arms served '$(cat "$OUT/label-bf16.txt")' -- the delta would be meaningless"
+fi
+
+log "comparison"
+python - "$OUT/gsm8k-bf16.json" "$OUT/gsm8k-quant.json" <<'PY'
+import json, sys
+
+# Schema written by run_math_reasoning_code.py: accuracy is a fraction,
+# alongside integer correct/total.
+a = json.load(open(sys.argv[1]))
+b = json.load(open(sys.argv[2]))
+
+if a['total'] != b['total']:
+    raise SystemExit(
+        f"arms graded different question counts ({a['total']} vs {b['total']}); "
+        "the delta is not a paired comparison"
+    )
+
+pa, pb = a['accuracy'] * 100, b['accuracy'] * 100
+print(f"  BF16       {pa:6.2f}%  ({a['correct']}/{a['total']})")
+print(f"  quantized  {pb:6.2f}%  ({b['correct']}/{b['total']})")
+print(f"  delta      {pb - pa:+6.2f} pt")
+print()
+print("  Expected at n=200: BF16 75.5%, INT8 73.5% -- a -2.0 pt gap that",
+      "McNemar puts at p = 0.585,")
+print("  i.e. not distinguishable from chance. RESULTS.md section 4.")
+print()
+print("  The aggregate hides the finding that matters for deployment: ~15% of",
+      "answers change")
+print("  under INT8, in BOTH directions (13 fixed, 17 broken). If per-response",
+      "reproducibility")
+print("  matters, that churn is the result, not the two points.")
+PY
+
+log "done -- results in $OUT"
