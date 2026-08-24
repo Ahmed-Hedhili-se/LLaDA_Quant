@@ -115,6 +115,35 @@ chat-templated, greedy.
 
 \* churn measured at n=50; per-item results were not captured at n=200 for INT4.
 
+### Replicated independently
+
+`MEASURED` — the INT8 arm was run again from scratch on a later date, from a
+**pre-quantized artifact** rather than a startup-time quantization, through
+`tools/run_gsm8k_comparison.sh`. Same config, same seed, same 200 questions.
+
+| run | BF16 | INT8 | delta | broken / fixed | McNemar |
+|---|---|---|---|---|---|
+| first | 75.5% (151/200) | 73.5% (147/200) | −2.0 pt | 17 / 13 | p = 0.585 |
+| **replication** | 75.5% (151/200) | **74.5%** (149/200) | **−1.0 pt** | **19 / 17** | **p = 0.868** |
+
+The BF16 arm reproduced exactly (151/200 both times), which is the check that
+makes the INT8 arms comparable — the harness is deterministic at temperature 0.
+
+The INT8 arm did not: 147 vs 149 correct. **Two questions of movement between
+two runs of the same model on the same questions**, because REFERENCE-mode
+numerics are identical but the *served* answers still sit near decision
+boundaries the churn measures. That is the honest size of the noise floor on
+this measurement, and it is roughly as large as the effect being measured.
+
+Both runs land in the same place: **the gap is not resolvable at n=200**.
+p = 0.585 and p = 0.868 are two draws from the same null. The replication makes
+the point more strongly than either run alone — reporting "−2.0 pt" as INT8's
+cost would have been reading noise, since asking the same question again
+returned −1.0.
+
+Item churn is now measured directly rather than estimated: **36 of 200 answers
+changed (18.0%)**, 19 broken and 17 fixed.
+
 ### INT8 is the deployable configuration
 
 13 items fixed, 17 broken, p = 0.585. A paired McNemar cannot distinguish that
