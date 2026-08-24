@@ -225,6 +225,90 @@ Completion lengths were comparable across arms (1002 / 996 / 984 tokens over
 10 requests), so the tok/s column is a fair comparison here — which is not
 something to assume, for the reason below.
 
+### Against the inference repository's own published numbers
+
+Their README reports, on **A40-24Q** with a tuned `moe_tune_config.json`:
+
+| their number | value | our A6000 equivalent |
+|---|---|---|
+| `model_update` B=1, gen=128 steps=128 block=32 | 4.60 s | BF16 **5.52 s**, INT8+fused **5.01 s** |
+| `fast_dense` batched, `BATCH_MAX_SIZE=32` | 243.2 tok/s | BF16 **230.5**, INT8+fused **227.6** |
+| GSM8K (n=50, A40) | 88.0% | BF16 **75.5%** (n=200, A6000) |
+
+Three caveats without which those columns are not comparable:
+
+**Their tok/s is not our tok/s.** `check_time_inference.py` computes
+`gen_length / mean_time` — all 128 tokens including EOS padding, on a prompt
+answered in two. `bench_served_throughput.py` counts real
+`usage.completion_tokens`. Their 27.86 tok/s and our 8.44 tok/s are not in
+conflict; they are different quantities. Only **seconds per generation at
+matched gen/steps/block** compares, which is why the first row is in seconds.
+
+**There is no tuned kernel config on this box.** `find` returns no
+`moe_tune_config.json`, and their README is emphatic: "If you deploy on
+different hardware, re-run the tuner — it is worth more than either kernel
+change", measured at 2.2x on the full MoE pipeline at M=2048. So our BF16
+baseline runs their Triton MoE on fallback configs. Our fused W8A16 kernel is
+untuned too, so the *comparison between our arms* is fair, but neither arm is
+at its ceiling and the 5.52 s should not be read against their tuned 4.60 s as
+a hardware result.
+
+**The accuracy gap is hardware, not quantization.** Their 88.0% was measured on
+A40-24Q at n=50; this machine's BF16 baseline is 75.5% at n=200 with the same
+config. Their own README documents the same class of effect — a near-uniform
+router where bf16 noise flips top-8 membership for 43-90% of positions. Only a
+same-machine BF16-vs-quantized delta is interpretable, which is what section 4
+reports.
+
+The batched row is the one that matters most, and it is examined next.
+
+### Under batching the speed win disappears `MEASURED`
+
+Everything above is batch 1. The inference repository's headline throughput
+number is **batched** (`BATCH_MAX_SIZE=32`, concurrency 32), so that is the
+configuration a deployment actually runs. Re-measured through the repo's own
+`eval/throughput/run_throughput.py`, its own command, on the A6000:
+
+| arm | wall | output tokens | tok/s | p50 | resident |
+|---|---|---|---|---|---|
+| BF16 | 35.3 s | 8128 | **230.5** | 17.63 s | 13.70 GiB |
+| INT8 PACKED + fused | 35.7 s | 8128 | **227.6** | 18.10 s | **7.89 GiB** |
+
+Identical output token counts (8128 both), and the server log confirms both
+arms formed the same batches (2x32 + 1x1), so this is a matched comparison.
+
+**0.99x. The fused kernel's advantage is gone.**
+
+That is not a disappointment, it is the roofline prediction landing exactly:
+
+| | M/expert | regime | measured |
+|---|---|---|---|
+| batch 1 | 4-16 | memory-bound | **1.11x faster** |
+| batch 32 | 512 | compute-bound | **0.99x — no change** |
+
+`bench_moe_regime.py` puts W8A16's crossover at M/expert = 101. Batch 1 sits
+far below it, batch 32 far above. Below the crossover the expert GEMM is
+waiting on weight bytes and halving them helps; above it the GEMM is waiting on
+FLOPs, which quantization does not reduce — W8A16 dequantizes to bf16 and
+multiplies in bf16 either way.
+
+**So the deployment answer depends entirely on the serving mode:**
+
+| serving mode | speed | memory |
+|---|---|---|
+| single request / low concurrency | **1.11x faster** | **0.58x** |
+| batched (their headline config) | **unchanged** | **0.58x** |
+
+Quantization is never a *loss* once the kernel is wired — it is a speed win at
+batch 1 and free memory at batch 32. What it is not, at batch 32, is a speed
+win, and reporting the 1.11x without this table would imply otherwise.
+
+This also settles what RESULTS.md previously listed as unestablished: whether
+freed capacity converts to throughput on the A6000. Their own batch sweep says
+throughput is past the knee by batch 32 (4x the batch bought 1.62x, the last
+step 8.2%), so the 5.8 GB INT8 frees buys single-digit percentages at best.
+The memory is worth having for *fitting* the model, not for speeding it up.
+
 ### tok/s is the wrong metric for a diffusion LM
 
 Every BF16 request took 11.7-12.6 s **regardless of how many tokens came out**.
