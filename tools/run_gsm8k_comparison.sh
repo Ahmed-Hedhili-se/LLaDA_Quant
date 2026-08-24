@@ -16,7 +16,11 @@
 # question 127 of 200.
 #
 #     nohup bash tools/run_gsm8k_comparison.sh > ~/gsm8k.log 2>&1 &
-#     tail -f ~/gsm8k.log
+#     tail -f --pid=$! ~/gsm8k.log
+#
+# The --pid matters: plain 'tail -f' never exits, so when the run finishes the
+# terminal just sits there and looks hung. With --pid the tail returns as soon
+# as the job does.
 #
 # Other forms:
 #
@@ -42,6 +46,10 @@ PORT="${PORT:-8000}"
 LIMIT="${LIMIT:-200}"
 SEED="${SEED:-42}"
 OUT="${OUT:-$HOME/gsm8k-results/n$LIMIT}"
+# FORCE=1 re-grades even when a matching result exists. Without it, a repeat
+# run of a finished comparison completes in seconds and only reprints -- which
+# looks indistinguishable from a hang if you are watching with plain "tail -f".
+FORCE="${FORCE:-0}"
 
 # The inference repo's recommended config -- the one section 4 of RESULTS.md
 # was measured with. Changing these makes the numbers incomparable.
@@ -100,11 +108,12 @@ run_arm() {
     # next stage died -- or because an ssh connection dropped -- is the
     # expensive failure. A result is only reused if it graded the same number
     # of questions, so a leftover smoke run never stands in for a real one.
-    if [ -f "$result" ]; then
+    if [ -f "$result" ] && [ "$FORCE" != "1" ]; then
         local done_n
         done_n=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['total'])"                  "$result" 2>/dev/null || echo 0)
         if [ "$done_n" = "$LIMIT" ]; then
             log "$arm: reusing $result ($done_n questions already graded)"
+            echo "   nothing to run. FORCE=1 re-grades from scratch."
             return 0
         fi
         log "$arm: discarding $result -- it graded $done_n, this run wants $LIMIT"

@@ -251,7 +251,18 @@ number that section 7's fused arm is compared against.
 ```bash
 cd ~/LLaDA_Quant
 nohup bash tools/run_gsm8k_comparison.sh > ~/gsm8k.log 2>&1 &
-tail -f ~/gsm8k.log        # Ctrl-C stops watching, not the run
+tail -f --pid=$! ~/gsm8k.log      # returns by itself when the run ends
+```
+
+**Use `--pid=$!`.** A plain `tail -f` never exits, so a finished run leaves
+the terminal sitting on a complete log looking hung. `--pid` makes the tail
+return the moment the job does.
+
+**Re-running a finished comparison takes seconds** — it reuses both arms and
+only reprints the result. That is not a hang. To actually re-grade:
+
+```bash
+FORCE=1 nohup bash tools/run_gsm8k_comparison.sh > ~/gsm8k.log 2>&1 &
 ```
 
 **Run it detached.** A dropped ssh connection SIGHUPs the foreground process
