@@ -11,9 +11,9 @@ MoE path still dequantizes into HBM before an unchanged BF16 GEMM — so the
 deployed model is a **capacity win, not a speed win**.
 
 That is no longer true with the fused kernel installed. `fused_moe_w8a16` plus
-`runtime/fused_block.py` makes the served model **1.08x faster than BF16 on 0.58x
-the memory** -- quantized and faster at the same time. Numbers in
-[section 5](#5-speed).
+`runtime/fused_block.py` makes the served model **1.11x faster than BF16 on 0.58x
+the memory** -- quantized and faster at the same time, measured over HTTP from a
+pre-quantized artifact. Numbers in [section 5](#5-speed).
 
 - [1. Setup](#1-setup)
 - [2. Memory](#2-memory)
@@ -200,6 +200,49 @@ More tokens add GEMM work; the dequantization is already paid.
 |---|---|---|---|
 | BF16 | 6.08 | **21.06** | — |
 | INT4-PACKED | 37.96 | **3.37** | **0.16x** |
+
+### Served throughput, over HTTP `MEASURED`
+
+The numbers above are in-process. This is what a client gets: real requests
+through the batch collector and FastAPI, all three arms from the same
+launcher, quantized arms loaded from the **pre-quantized artifact**.
+
+| arm | s/request | vs BF16 | tok/s | resident |
+|---|---|---|---|---|
+| BF16 | 11.88 | — | 8.44 | 13.70 GiB |
+| INT8 PACKED (dequant/access) | 60.57 | **0.20x** | 1.65 | 7.89 GiB |
+| **INT8 PACKED + fused W8A16** | **10.71** | **1.11x** | 9.19 | **7.89 GiB** |
+
+**1.11x faster than BF16 on 0.58x the memory**, served over HTTP from an
+artifact. That matches the 1.10x measured in-process by `bench_fused_e2e.py`,
+which is the check that the HTTP layer is not hiding or inventing anything.
+
+It also settles a claim that had only been asserted: an artifact serves at the
+same speed as a startup-time quantization. The tensors are bit-identical
+(section 10), and now the served latency is too.
+
+Completion lengths were comparable across arms (1002 / 996 / 984 tokens over
+10 requests), so the tok/s column is a fair comparison here — which is not
+something to assume, for the reason below.
+
+### tok/s is the wrong metric for a diffusion LM
+
+Every BF16 request took 11.7-12.6 s **regardless of how many tokens came out**.
+The decoder runs a fixed number of denoising steps whatever the answer turns
+out to be, so request latency is flat and tok/s measures answer length:
+
+| answer | time | reported tok/s |
+|---|---|---|
+| 3 tokens | 11.70 s | 0.26 |
+| 204 tokens | 11.77 s | 17.33 |
+
+The same ~12 s of compute reads as a 67x throughput difference. On an
+autoregressive model those two requests would differ in latency by 68x; here
+they do not differ at all. **Compare arms on seconds per request**, and treat
+any tok/s comparison across differing prompt sets as meaningless.
+
+This is a property of diffusion decoding, not of quantization, but it makes
+every throughput number in this section easy to misreport.
 
 ### Where the 249 ms goes
 
