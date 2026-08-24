@@ -37,6 +37,7 @@ here reports a benefit from it.
 | **Offline quantization to a reusable artifact** (`tools/quantize_checkpoint.py`) | IMPLEMENTED, **MEASURED — bit-identical to a startup quantization** |
 | Served throughput over HTTP, all arms | **MEASURED** |
 | **Batched throughput (their `BATCH_MAX_SIZE=32` config)** | **MEASURED — 0.99x: the speed win does not survive batching** |
+| **Batched throughput at concurrency 64** | **MEASURED — 0.50x: a real loss, cause not yet established** |
 | GSM8K under the **fused kernel** specifically | **MEASURED — 73.5% vs BF16 75.5%, p = 0.627** |
 
 > **Where speed stands.** Quantization is no longer only a capacity win.
@@ -81,18 +82,50 @@ here reports a benefit from it.
 > | BF16 | 35.3 s | 8128 | 230.5 | 13.70 GiB |
 > | PACKED + fused W8A16 | 35.7 s | 8128 | **227.6 — 0.99x** | **7.89 GiB** |
 >
-> That is the roofline landing, not a regression: W8A16's crossover is
+> That much is the roofline landing, not a regression: W8A16's crossover is
 > M/expert = 101, batch 1 sits at 4-16 and batch 32 at 512. Below the crossover
 > the GEMM waits on weight bytes and halving them helps; above it the GEMM waits
 > on FLOPs, which weight-only quantization does not reduce.
 >
+> **At concurrency 64 it becomes an outright loss**, and the roofline does not
+> explain this one (`BATCH_MAX_SIZE=64`, concurrency 64, 128 requests):
+>
+> | arm | wall | tok/s | vs BF16 | p50 | resident |
+> |---|---:|---:|---:|---:|---:|
+> | BF16 | 70.4 s | 230.8 | 1.00x | 35.2 s | 13.70 GiB |
+> | PACKED (dequantize per access) | 165.4 s | 98.3 | 0.43x | 82.9 s | 7.89 GiB |
+> | **PACKED + fused W8A16** | 142.1 s | **114.4** | **0.50x** | 71.0 s | **7.89 GiB** |
+>
+> The fused kernel still beats the dequantize path it replaces (1.16x), and
+> `/v1/quantization` confirmed `fused_kernel: true, fused_blocks: 16` — it was
+> genuinely installed. But **BF16 is 2.02x faster.**
+>
+> **This is not just the crossover, and it should not be reported as such.**
+> Going from concurrency 32 to 64, BF16 is flat (230.5 -> 230.8 tok/s) while the
+> fused arm halves (227.6 -> 114.4). A roofline argument predicts convergence to
+> parity, not a 2x collapse that appears only above concurrency 32 and only on
+> one arm. Two candidates, neither yet tested:
+>
+> - **The W8A16 tiles are untuned.** The BF16 path goes through the inference
+>   repo's `get_best_config` and its tuned `moe_tune_config.json`;
+>   `w8a16_moe.default_config` returns a fixed `BM=32, BN=128, BK=128`. At
+>   M=2048 a fixed tile can be far off, and tuning is documented in that repo as
+>   the single largest speed lever it found.
+> - **The BF16 arm keeps the fused SiLU epilogue**, which the quantized arms
+>   give up by design, so part of the gap is a conceded optimization rather than
+>   the dequant.
+>
 > | serving mode | speed | memory |
 > |---|---|---|
 > | single request / low concurrency | **1.11x faster** | **0.58x** |
-> | batched | **unchanged** | **0.58x** |
+> | batched, concurrency 32 | **unchanged (0.99x)** | **0.58x** |
+> | batched, concurrency 64 | **0.50x — a real loss** | **0.58x** |
 >
-> Quantization is never a loss once the kernel is wired. What it is not, when
-> batched, is a speed win.
+> So the earlier claim that "quantization is never a loss once the kernel is
+> wired" was too strong: it held at every batch size measured at the time, and
+> stopped holding at the first larger one tried. **For throughput serving on a
+> 48 GB card, BF16 remains the right choice.** Quantization's case is low-batch
+> latency and capacity, not throughput.
 >
 > **Accuracy under the fused kernel, measured separately** — it is a different
 > computation from REFERENCE/PACKED (fp32 accumulation inside the K-loop vs a
