@@ -144,6 +144,51 @@ returned −1.0.
 Item churn is now measured directly rather than estimated: **36 of 200 answers
 changed (18.0%)**, 19 broken and 17 fixed.
 
+### The fused kernel graded separately `MEASURED`
+
+Every speed number in section 5 is the fused path, but the accuracy above was
+measured in REFERENCE mode. Those are **not** the same computation: REFERENCE
+and PACKED dequantize to bf16 in HBM and hand cuBLAS a bf16 matrix, while the
+fused kernel dequantizes inside the GEMM's K-loop and accumulates in fp32.
+Same weights, different arithmetic — so it needed its own run.
+
+| config | accuracy | vs BF16 | McNemar | churn vs BF16 |
+|---|---|---|---|---|
+| BF16 | **75.5%** (151/200) | — | — | — |
+| INT8 REFERENCE / PACKED | **74.5%** (149/200) | −1.0 pt | p = 0.868 | 18.0% |
+| **INT8 PACKED + fused W8A16** | **73.5%** (147/200) | **−2.0 pt** | **p = 0.627** | 19.0% |
+
+**The kernel costs nothing measurable.** Three INT8-family runs have now landed
+at 147, 149, 147 correct against BF16's 151, with p between 0.585 and 0.868.
+
+**BF16 reproduced item-for-item**, not merely in aggregate: the two independent
+BF16 runs agree on all 200 individual questions. That is what makes the INT8
+arms comparable to each other rather than to a moving baseline.
+
+### The two quantized paths disagree more with each other than with BF16
+
+| pair | churn | McNemar |
+|---|---|---|
+| BF16 vs INT8 REFERENCE | 18.0% (36/200) | p = 0.868 |
+| BF16 vs INT8 + fused | 19.0% (38/200) | p = 0.627 |
+| **INT8 REFERENCE vs INT8 + fused** | **23.0% (46/200)** | p = 0.883 |
+
+Those two arms hold **bit-identical weights**. The only difference is where the
+dequantization happens and what the accumulator's precision is. That alone
+moves 46 of 200 answers — more than quantization itself moves them.
+
+This is the near-uniform router again (section 4, and the inference repo's own
+README): top-1 routing weight is ~1.7–5%, so top-8 membership sits on a
+boundary any bf16-level perturbation can flip. Changing the accumulation order
+inside the GEMM is such a perturbation.
+
+**The practical consequence:** per-response reproducibility on this checkpoint
+is not a property of the weights, it is a property of the exact kernel. Two
+mathematically equivalent implementations of the same quantized model give
+different answers to a quarter of the questions while scoring the same. If a
+deployment needs stable outputs across a kernel upgrade, that has to be
+designed for — it does not come free from freezing the weights.
+
 ### INT8 is the deployable configuration
 
 13 items fixed, 17 broken, p = 0.585. A paired McNemar cannot distinguish that
