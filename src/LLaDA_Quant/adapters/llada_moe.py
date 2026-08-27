@@ -130,6 +130,7 @@ def quantize_llada_experts(model: nn.Module, config: QuantConfig) -> List[Target
             scale_dtype=scale_dtype,
             scale_search=config.scale_search,
             search_grid=config.search_grid,
+            dtype=config.dtype,
         )
         attach_packed_buffers(block, weights, compute_dtype, config.compile_dequant)
 
@@ -173,8 +174,8 @@ def restore_llada_experts_from_buffers(model: nn.Module, config: QuantConfig) ->
         if not all(hasattr(block, b) for b in PACKED_BUFFERS):
             continue
         weights = QuantExpertWeights(
-            w1=quant_result_from_buffers(block._qw1, block._sw1, config.bits),
-            w2=quant_result_from_buffers(block._qw2, block._sw2, config.bits),
+            w1=quant_result_from_buffers(block._qw1, block._sw1, config.bits, qtype=config.dtype),
+            w2=quant_result_from_buffers(block._qw2, block._sw2, config.bits, qtype=config.dtype),
         )
         attach_packed_buffers(block, weights, compute_dtype, config.compile_dequant)
         if config.mode is ExecutionMode.PACKED:

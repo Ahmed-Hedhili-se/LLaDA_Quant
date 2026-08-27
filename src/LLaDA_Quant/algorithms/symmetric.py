@@ -59,6 +59,11 @@ class QuantResult:
     group_size: int
     packed: bool = False
     logical_shape: Tuple[int, ...] = ()
+    #: ``"int"`` (this module's uniform integer grid) or ``"fp8_e4m3"``
+    #: (algorithms.fp8's floating grid). Dispatches ``dequantize()`` below --
+    #: everything else in this dataclass (storage_bytes, shape bookkeeping)
+    #: is dtype-agnostic and needs no branch.
+    qtype: str = "int"
 
     def __post_init__(self) -> None:
         if not self.logical_shape:
@@ -68,6 +73,10 @@ class QuantResult:
             self.logical_shape = tuple(shape)
 
     def dequantize(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        if self.qtype == "fp8_e4m3":
+            from .fp8 import dequantize_tensor_fp8  # local: avoids a cycle at import time
+
+            return dequantize_tensor_fp8(self.q, self.scale, self.group_size, dtype=dtype)
         return dequantize_tensor(
             self.q,
             self.scale,

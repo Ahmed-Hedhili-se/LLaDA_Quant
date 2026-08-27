@@ -36,6 +36,8 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 
+from ..algorithms.fp8 import QTYPE as FP8_QTYPE
+from ..algorithms.fp8 import dequantize_tensor_fp8, quantize_tensor_fp8
 from ..algorithms.symmetric import QuantResult, dequantize_tensor, quantize_tensor
 
 W1 = "w1"
@@ -62,7 +64,11 @@ class QuantExpertWeights:
         scale_dtype: torch.dtype = torch.float32,
         scale_search: str = "amax",
         search_grid: int = 24,
+        dtype: str = "int",
     ) -> "QuantExpertWeights":
+        if dtype == FP8_QTYPE:
+            kwargs = dict(group_size=group_size, scale_dtype=scale_dtype)
+            return cls(w1=quantize_tensor_fp8(w1, **kwargs), w2=quantize_tensor_fp8(w2, **kwargs))
         kwargs = dict(
             bits=bits,
             group_size=group_size,
@@ -79,7 +85,9 @@ class QuantExpertWeights:
         return self.w1.storage_bytes() + self.w2.storage_bytes()
 
 
-def quant_result_from_buffers(q: torch.Tensor, scale: torch.Tensor, bits: int) -> QuantResult:
+def quant_result_from_buffers(
+    q: torch.Tensor, scale: torch.Tensor, bits: int, qtype: str = "int"
+) -> QuantResult:
     """Rebuild a :class:`QuantResult` from stored tensors alone.
 
     The effective group size is *derived* from the scale tensor rather than
@@ -88,7 +96,7 @@ def quant_result_from_buffers(q: torch.Tensor, scale: torch.Tensor, bits: int) -
     config here would dequantize with the wrong grouping and produce garbage
     that still has the right shape.
     """
-    packed = bits == 4
+    packed = qtype == "int" and bits == 4
     k_logical = q.shape[-1] * (2 if packed else 1)
     num_groups = scale.shape[-1] if scale.dim() else 1
     group_size = -1 if num_groups <= 1 else k_logical // num_groups
@@ -99,6 +107,7 @@ def quant_result_from_buffers(q: torch.Tensor, scale: torch.Tensor, bits: int) -
         group_size=group_size,
         packed=packed,
         logical_shape=tuple(list(q.shape[:-1]) + [k_logical]),
+        qtype=qtype,
     )
 
 
@@ -110,11 +119,12 @@ def quantize_fused_experts(
     scale_dtype: torch.dtype = torch.float32,
     scale_search: str = "amax",
     search_grid: int = 24,
+    dtype: str = "int",
 ) -> QuantExpertWeights:
     """Convenience wrapper: quantize a fused ``w1``/``w2`` pair."""
     return QuantExpertWeights.quantize(
         w1, w2, bits=bits, group_size=group_size, scale_dtype=scale_dtype,
-        scale_search=scale_search, search_grid=search_grid,
+        scale_search=scale_search, search_grid=search_grid, dtype=dtype,
     )
 
 
@@ -162,6 +172,7 @@ def attach_packed_buffers(
             "bits": weights.w1.bits,
             "group_size": weights.w1.group_size,
             "packed": weights.w1.packed,
+            "qtype": weights.w1.qtype,
             "compute_dtype": compute_dtype,
             "compile_dequant": compile_dequant,
             "logical_shape": {W1: weights.w1.logical_shape, W2: weights.w2.logical_shape},
@@ -205,14 +216,17 @@ def _packed_expert_weight(self: nn.Module, which: str) -> torch.Tensor:
             "load_quantized_weights() so the quantization config is applied."
         )
     suffix = which[-1]
+    q = getattr(self, f"_qw{suffix}")
+    s = getattr(self, f"_sw{suffix}")
+    if meta.get("qtype", "int") == FP8_QTYPE:
+        # No compiled path yet -- eager fp8 dequant only. Same "PACKED
+        # without a fused/compiled kernel" tier INT4 already ships at;
+        # a future milestone, not a gap unique to fp8.
+        return dequantize_tensor_fp8(q, s, meta["group_size"], dtype=meta["compute_dtype"])
     dequantize = compiled_dequantize() if meta.get("compile_dequant") else dequantize_tensor
     return dequantize(
-        getattr(self, f"_qw{suffix}"),
-        getattr(self, f"_sw{suffix}"),
-        meta["bits"],
-        meta["group_size"],
-        dtype=meta["compute_dtype"],
-        packed=meta["packed"],
+        q, s, meta["bits"], meta["group_size"],
+        dtype=meta["compute_dtype"], packed=meta["packed"],
     )
 
 

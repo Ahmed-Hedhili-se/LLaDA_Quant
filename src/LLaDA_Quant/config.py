@@ -56,6 +56,14 @@ COMPONENT_EXPERT = "expert"
 KNOWN_TARGETS = (COMPONENT_EXPERT, COMPONENT_LINEAR)
 
 
+#: ``"int"`` -- this module's uniform integer grid (bits=8 or bits=4,
+#: algorithms.symmetric). ``"fp8_e4m3"`` -- algorithms.fp8's floating grid,
+#: always 8-bit storage (bits is still required to be 8 for byte-accounting
+#: symmetry with the int8 path; it does not otherwise participate in fp8's
+#: quantize/dequantize math, which reads directly off FP8_E4M3_MAX).
+KNOWN_DTYPES = ("int", "fp8_e4m3")
+
+
 @dataclass(frozen=True)
 class QuantConfig:
     bits: int = 8
@@ -73,9 +81,25 @@ class QuantConfig:
     expect_expert_blocks: Optional[int] = None
     expect_linears: Optional[int] = None
     allow_no_matches: bool = False
+    dtype: str = "int"
 
     def __post_init__(self) -> None:
-        if self.bits not in (8, 4):
+        if self.dtype not in KNOWN_DTYPES:
+            raise ValueError(f"dtype must be one of {KNOWN_DTYPES}, got {self.dtype!r}")
+        if self.dtype == "fp8_e4m3":
+            if self.bits != 8:
+                raise ValueError(
+                    f"dtype='fp8_e4m3' stores one byte per weight like bits=8; "
+                    f"got bits={self.bits}. fp8's own format fixes the bit width -- "
+                    "this field only feeds storage-byte accounting for it."
+                )
+            if self.scale_search != "amax":
+                raise ValueError(
+                    "scale_search='mse' searches an integer clamp grid "
+                    "(qmax_for_bits) that fp8_e4m3 does not use; only 'amax' "
+                    "is meaningful here."
+                )
+        elif self.bits not in (8, 4):
             raise ValueError(f"bits must be 8 or 4, got {self.bits}")
         if self.group_size <= 0 and self.group_size != -1:
             raise ValueError(f"group_size must be > 0 or -1, got {self.group_size}")
